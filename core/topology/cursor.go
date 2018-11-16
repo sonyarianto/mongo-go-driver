@@ -16,6 +16,7 @@ import (
 	"github.com/mongodb/mongo-go-driver/bson/bsontype"
 	"github.com/mongodb/mongo-go-driver/core/command"
 	"github.com/mongodb/mongo-go-driver/core/session"
+	"github.com/mongodb/mongo-go-driver/core/wiremessage"
 	"github.com/mongodb/mongo-go-driver/x/bsonx"
 )
 
@@ -30,6 +31,12 @@ type cursor struct {
 	server        *Server
 	opts          []bsonx.Elem
 	registry      *bsoncodec.Registry
+
+	// legacy server (< 3.2) fields
+	legacyServer bool
+	batchSize    int32
+	limit        int32
+	numReturned  int32 // number of docs returned by server
 }
 
 func newCursor(result bson.Raw, clientSession *session.Client, clock *session.ClusterClock, server *Server, opts ...bsonx.Elem) (command.Cursor, error) {
@@ -92,6 +99,29 @@ func newCursor(result bson.Raw, clientSession *session.Client, clock *session.Cl
 	return c, nil
 }
 
+func newLegacyCursor(ns command.Namespace, cursorID int64, batch []bson.Raw, limit int32, batchSize int32, server *Server) (command.Cursor, error) {
+	c := &cursor{
+		id:           cursorID,
+		current:      -1,
+		server:       server,
+		registry:     server.cfg.registry,
+		namespace:    ns,
+		legacyServer: true,
+		limit:        limit,
+		batchSize:    batchSize,
+		numReturned:  int32(len(batch)),
+	}
+
+	for _, doc := range batch {
+		c.batch = append(c.batch, bson.RawValue{
+			Type:  bsontype.EmbeddedDocument,
+			Value: doc,
+		})
+	}
+
+	return c, nil
+}
+
 // close the associated session if it's implicit
 func (c *cursor) closeImplicitSession() {
 	if c.clientSession != nil && c.clientSession.SessionType == session.Implicit {
@@ -113,7 +143,11 @@ func (c *cursor) Next(ctx context.Context) bool {
 		return true
 	}
 
-	c.getMore(ctx)
+	if c.legacyServer {
+		c.legacyGetMore(ctx)
+	} else {
+		c.getMore(ctx)
+	}
 
 	// call the getMore command in a loop until at least one document is returned in the next batch
 	for len(c.batch) == 0 {
@@ -173,15 +207,83 @@ func (c *cursor) Close(ctx context.Context) error {
 	return conn.Close()
 }
 
-func (c *cursor) getMore(ctx context.Context) {
-	// clear out the batch slice so we can reuse it.
+// clear out the cursor's batch slice
+func (c *cursor) clearBatch() {
 	for idx := range c.batch {
 		c.batch[idx].Type = bsontype.Type(0)
 		c.batch[idx].Value = nil
 	}
+
 	c.batch = c.batch[:0]
 	c.current = 0
+}
 
+func (c *cursor) legacyGetMore(ctx context.Context) {
+	c.clearBatch()
+	if c.id == 0 {
+		return
+	}
+
+	conn, err := c.server.Connection(ctx)
+	if err != nil {
+		c.err = err
+		return
+	}
+
+	gm := wiremessage.GetMore{
+		FullCollectionName: c.namespace.DB + "." + c.namespace.Collection,
+		CursorID:           c.id,
+		NumberToReturn:     c.batchSize,
+	}
+
+	err = conn.WriteWireMessage(ctx, gm)
+	if err != nil {
+		_ = conn.Close()
+		c.err = err
+		return
+	}
+
+	response, err := conn.ReadWireMessage(ctx)
+	if err != nil {
+		_ = conn.Close()
+		c.err = err
+		return
+	}
+
+	err = conn.Close()
+	if err != nil {
+		c.err = err
+		return
+	}
+
+	reply, ok := response.(wiremessage.Reply)
+	if !ok {
+		c.err = errors.New("did not receive OP_REPLY response")
+	}
+	err = validateGetMoreReply(reply)
+	if err != nil {
+		c.err = err
+		return
+	}
+
+	c.numReturned += reply.NumberReturned
+	numDocs := reply.NumberReturned // number of docs to put into the batch
+	if c.limit != 0 && c.numReturned > c.limit {
+		numDocs = reply.NumberReturned - (c.numReturned - c.limit)
+	}
+
+	c.id = reply.CursorID
+	var i int32
+	for i = 0; i < numDocs; i++ {
+		c.batch = append(c.batch, bson.RawValue{
+			Type:  bsontype.EmbeddedDocument,
+			Value: reply.Documents[i],
+		})
+	}
+}
+
+func (c *cursor) getMore(ctx context.Context) {
+	c.clearBatch()
 	if c.id == 0 {
 		return
 	}
@@ -242,4 +344,18 @@ func (c *cursor) getMore(ctx context.Context) {
 	c.batch, c.err = arr.Values()
 
 	return
+}
+
+func validateGetMoreReply(reply wiremessage.Reply) error {
+	if int(reply.NumberReturned) != len(reply.Documents) {
+		return command.NewCommandResponseError("malformed OP_REPLY: NumberReturned does not match number of returned documents", nil)
+	}
+
+	if reply.ResponseFlags&wiremessage.CursorNotFound > 0 {
+		return command.QueryFailureError{
+			Message: "query failure - cursor not found",
+		}
+	}
+
+	return nil
 }
