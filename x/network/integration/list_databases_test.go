@@ -10,11 +10,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/mongodb/mongo-go-driver/internal/testutil"
-	"github.com/mongodb/mongo-go-driver/mongo/writeconcern"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/network/command"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
+	"go.mongodb.org/mongo-driver/internal/testutil"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/network/command"
 )
 
 func TestListDatabases(t *testing.T) {
@@ -25,9 +25,9 @@ func TestListDatabases(t *testing.T) {
 			t.FailNow()
 		}
 	}
-	server, err := testutil.Topology(t).SelectServer(context.Background(), description.WriteSelector())
+	server, err := testutil.Topology(t).SelectServerLegacy(context.Background(), description.WriteSelector())
 	noerr(t, err)
-	conn, err := server.Connection(context.Background())
+	conn, err := server.ConnectionLegacy(context.Background())
 	noerr(t, err)
 
 	wc := writeconcern.New(writeconcern.WMajority())

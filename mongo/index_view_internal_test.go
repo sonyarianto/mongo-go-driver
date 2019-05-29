@@ -11,13 +11,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"math/rand"
+	"reflect"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/mongodb/mongo-go-driver/mongo/options"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
 	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/x/bsonx"
 )
 
 var seed = time.Now().UnixNano()
@@ -26,6 +27,42 @@ type index struct {
 	Key  map[string]int
 	NS   string
 	Name string
+}
+
+func getIndexDoc(t *testing.T, coll *Collection, expectedKeyDoc bsonx.Doc) bsonx.Doc {
+	c, err := coll.Indexes().List(ctx)
+	require.NoError(t, err)
+
+	for c.Next(ctx) {
+		var index bsonx.Doc
+		require.NoError(t, c.Decode(&index))
+
+		for _, elem := range index {
+			if elem.Key != "key" {
+				continue
+			}
+
+			keyDoc := elem.Value.Document()
+			if reflect.DeepEqual(keyDoc, expectedKeyDoc) {
+				return index
+			}
+		}
+	}
+
+	return nil
+}
+
+func checkIndexDocContains(t *testing.T, indexDoc bsonx.Doc, expectedElem bsonx.Elem) {
+	for _, elem := range indexDoc {
+		if elem.Key != expectedElem.Key {
+			continue
+		}
+
+		require.Equal(t, elem, expectedElem)
+		return
+	}
+
+	t.Fatal("no matching element found")
 }
 
 func getIndexableCollection(t *testing.T) (string, *Collection) {
@@ -139,7 +176,7 @@ func TestIndexView_CreateOneWithNameOption(t *testing.T) {
 		context.Background(),
 		IndexModel{
 			Keys:    bsonx.Doc{{"foo", bsonx.Int32(-1)}},
-			Options: NewIndexOptionsBuilder().Name("testname").Build(),
+			Options: options.Index().SetName("testname"),
 		},
 	)
 	require.NoError(t, err)
@@ -182,31 +219,35 @@ func TestIndexView_CreateOneWithAllOptions(t *testing.T) {
 		context.Background(),
 		IndexModel{
 			Keys: bsonx.Doc{{"foo", bsonx.String("text")}},
-			Options: NewIndexOptionsBuilder().
-				Background(false).
-				ExpireAfterSeconds(10).
-				Name("a").
-				Sparse(false).
-				Unique(false).
-				Version(1).
-				DefaultLanguage("english").
-				LanguageOverride("english").
-				TextVersion(1).
-				Weights(bsonx.Doc{}).
-				SphereVersion(1).
-				Bits(32).
-				Max(10).
-				Min(1).
-				BucketSize(1).
-				PartialFilterExpression(bsonx.Doc{}).
-				StorageEngine(bsonx.Doc{{"wiredTiger", bsonx.Document(bsonx.Doc{{"configString", bsonx.String("block_compressor=zlib")}})}}).
-				Build(),
+			Options: options.Index().
+				SetBackground(false).
+				SetExpireAfterSeconds(10).
+				SetName("a").
+				SetSparse(false).
+				SetUnique(false).
+				SetVersion(1).
+				SetDefaultLanguage("english").
+				SetLanguageOverride("english").
+				SetTextVersion(1).
+				SetWeights(bsonx.Doc{}).
+				SetSphereVersion(1).
+				SetBits(2).
+				SetMax(10).
+				SetMin(1).
+				SetBucketSize(1).
+				SetPartialFilterExpression(bsonx.Doc{}).
+				SetStorageEngine(bsonx.Doc{
+					{"wiredTiger", bsonx.Document(bsonx.Doc{
+						{"configString", bsonx.String("block_compressor=zlib")},
+					})},
+				}),
 		},
 	)
 	require.NoError(t, err)
 }
 
 func TestIndexView_CreateOneWithCollationOption(t *testing.T) {
+	skipIfBelow34(t, createTestDatabase(t, nil)) // collation invalid for server versions < 3.4
 	t.Parallel()
 
 	if testing.Short() {
@@ -220,12 +261,57 @@ func TestIndexView_CreateOneWithCollationOption(t *testing.T) {
 		context.Background(),
 		IndexModel{
 			Keys: bsonx.Doc{{"bar", bsonx.String("text")}},
-			Options: NewIndexOptionsBuilder().
-				Collation(bsonx.Doc{{"locale", bsonx.String("simple")}}).
-				Build(),
+			Options: options.Index().SetCollation(&options.Collation{
+				Locale: "simple",
+			}),
 		},
 	)
 	require.NoError(t, err)
+}
+
+func TestIndexView_CreateOneWildcard(t *testing.T) {
+	coll := createTestCollection(t, nil, nil)
+	version, err := getServerVersion(coll.Database())
+	require.NoError(t, err)
+	if compareVersions(t, version, "4.1") < 0 {
+		t.Skip("skipping for server versions < 4.1")
+	}
+
+	iv := coll.Indexes()
+	keysDoc := bsonx.Doc{
+		{"$**", bsonx.Int32(1)},
+	}
+	t.Run("CreateWildcardIndex", func(t *testing.T) {
+		_, err := iv.CreateOne(ctx, IndexModel{
+			Keys: keysDoc,
+		})
+		require.NoError(t, err)
+		indexDoc := getIndexDoc(t, coll, keysDoc)
+		require.NotNil(t, indexDoc)
+	})
+
+	t.Run("CreateWildcardIndexWithProjection", func(t *testing.T) {
+		_, err := iv.DropAll(ctx)
+		require.NoError(t, err)
+
+		_, err = iv.CreateOne(ctx, IndexModel{
+			Keys: keysDoc,
+			Options: options.Index().SetWildcardProjection(bsonx.Doc{
+				{"a", bsonx.Int32(1)},
+				{"b.c", bsonx.Int32(1)},
+			}),
+		})
+		require.NoError(t, err)
+		indexDoc := getIndexDoc(t, coll, keysDoc)
+		require.NotNil(t, indexDoc)
+		checkIndexDocContains(t, indexDoc, bsonx.Elem{
+			Key: "wildcardProjection",
+			Value: bsonx.Document(bsonx.Doc{
+				{"a", bsonx.Int32(1)},
+				{"b.c", bsonx.Int32(1)},
+			}),
+		})
+	})
 }
 
 func TestIndexView_CreateOneWithNilKeys(t *testing.T) {

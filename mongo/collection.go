@@ -10,17 +10,21 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
-	"github.com/mongodb/mongo-go-driver/bson/bsoncodec"
-	"github.com/mongodb/mongo-go-driver/mongo/options"
-	"github.com/mongodb/mongo-go-driver/mongo/readconcern"
-	"github.com/mongodb/mongo-go-driver/mongo/readpref"
-	"github.com/mongodb/mongo-go-driver/mongo/writeconcern"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/session"
-	"github.com/mongodb/mongo-go-driver/x/network/command"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
+	"go.mongodb.org/mongo-driver/bson/bsoncodec"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/x/mongo/driverlegacy"
+	"go.mongodb.org/mongo-driver/x/network/command"
 )
 
 // Collection performs operations on a given collection.
@@ -34,6 +38,12 @@ type Collection struct {
 	readSelector   description.ServerSelector
 	writeSelector  description.ServerSelector
 	registry       *bsoncodec.Registry
+}
+
+func closeImplicitSession(sess *session.Client) {
+	if sess != nil && sess.SessionType == session.Implicit {
+		sess.EndSession()
+	}
 }
 
 func newCollection(db *Database, name string, opts ...*options.CollectionOptions) *Collection {
@@ -149,7 +159,7 @@ func (coll *Collection) BulkWrite(ctx context.Context, models []WriteModel,
 	opts ...*options.BulkWriteOptions) (*BulkWriteResult, error) {
 
 	if len(models) == 0 {
-		return nil, errors.New("a bulk write must contain at least one write model")
+		return nil, ErrEmptySlice
 	}
 
 	if ctx == nil {
@@ -158,17 +168,20 @@ func (coll *Collection) BulkWrite(ctx context.Context, models []WriteModel,
 
 	sess := sessionFromContext(ctx)
 
-	err := coll.client.ValidSession(sess)
+	err := coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
 
-	dispatchModels := make([]driver.WriteModel, len(models))
+	dispatchModels := make([]driverlegacy.WriteModel, len(models))
 	for i, model := range models {
+		if model == nil {
+			return nil, ErrNilDocument
+		}
 		dispatchModels[i] = model.convertModel()
 	}
 
-	res, err := driver.BulkWrite(
+	res, err := driverlegacy.BulkWrite(
 		ctx,
 		coll.namespace(),
 		dispatchModels,
@@ -183,168 +196,142 @@ func (coll *Collection) BulkWrite(ctx context.Context, models []WriteModel,
 		coll.registry,
 		opts...,
 	)
-
-	if err != nil {
-		if conv, ok := err.(driver.BulkWriteException); ok {
-			return &BulkWriteResult{}, BulkWriteException{
-				WriteConcernError: convertWriteConcernError(conv.WriteConcernError),
-				WriteErrors:       convertBulkWriteErrors(conv.WriteErrors),
-			}
-		}
-
-		return &BulkWriteResult{}, replaceTopologyErr(err)
-	}
-
-	return &BulkWriteResult{
+	result := BulkWriteResult{
 		InsertedCount: res.InsertedCount,
 		MatchedCount:  res.MatchedCount,
 		ModifiedCount: res.ModifiedCount,
 		DeletedCount:  res.DeletedCount,
 		UpsertedCount: res.UpsertedCount,
 		UpsertedIDs:   res.UpsertedIDs,
-	}, nil
+	}
+
+	return &result, replaceErrors(err)
 }
 
-// InsertOne inserts a single document into the collection.
-func (coll *Collection) InsertOne(ctx context.Context, document interface{},
-	opts ...*options.InsertOneOptions) (*InsertOneResult, error) {
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	doc, err := transformDocument(coll.registry, document)
-	if err != nil {
-		return nil, err
-	}
-
-	doc, insertedID := ensureID(doc)
-
-	sess := sessionFromContext(ctx)
-
-	err = coll.client.ValidSession(sess)
-	if err != nil {
-		return nil, err
-	}
-
-	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
-		wc = nil
-	}
-	oldns := coll.namespace()
-	cmd := command.Insert{
-		NS:           command.Namespace{DB: oldns.DB, Collection: oldns.Collection},
-		Docs:         []bsonx.Doc{doc},
-		WriteConcern: wc,
-		Session:      sess,
-		Clock:        coll.client.clock,
-	}
-
-	// convert to InsertManyOptions so these can be argued to dispatch.Insert
-	insertOpts := make([]*options.InsertManyOptions, len(opts))
-	for i, opt := range opts {
-		insertOpts[i] = options.InsertMany()
-		insertOpts[i].BypassDocumentValidation = opt.BypassDocumentValidation
-	}
-
-	res, err := driver.Insert(
-		ctx, cmd,
-		coll.client.topology,
-		coll.writeSelector,
-		coll.client.id,
-		coll.client.topology.SessionPool,
-		coll.client.retryWrites,
-		insertOpts...,
-	)
-
-	rr, err := processWriteError(res.WriteConcernError, res.WriteErrors, err)
-	if rr&rrOne == 0 {
-		return nil, err
-	}
-
-	return &InsertOneResult{InsertedID: insertedID}, err
-}
-
-// InsertMany inserts the provided documents.
-func (coll *Collection) InsertMany(ctx context.Context, documents []interface{},
-	opts ...*options.InsertManyOptions) (*InsertManyResult, error) {
+func (coll *Collection) insert(ctx context.Context, documents []interface{},
+	opts ...*options.InsertManyOptions) ([]interface{}, error) {
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	result := make([]interface{}, len(documents))
-	docs := make([]bsonx.Doc, len(documents))
+	docs := make([]bsoncore.Document, len(documents))
 
 	for i, doc := range documents {
-		bdoc, err := transformDocument(coll.registry, doc)
+		var err error
+		docs[i], result[i], err = transformAndEnsureIDv2(coll.registry, doc)
 		if err != nil {
 			return nil, err
 		}
-		bdoc, insertedID := ensureID(bdoc)
-
-		docs[i] = bdoc
-		result[i] = insertedID
 	}
 
 	sess := sessionFromContext(ctx)
+	if sess == nil && coll.client.topology.SessionPool != nil {
+		var err error
+		sess, err = session.NewClientSession(coll.client.topology.SessionPool, coll.client.id, session.Implicit)
+		if err != nil {
+			return nil, err
+		}
+		defer sess.EndSession()
+	}
 
-	err := coll.client.ValidSession(sess)
+	err := coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
 
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
-
-	oldns := coll.namespace()
-	cmd := command.Insert{
-		NS:           command.Namespace{DB: oldns.DB, Collection: oldns.Collection},
-		Docs:         docs,
-		WriteConcern: wc,
-		Session:      sess,
-		Clock:        coll.client.clock,
+	if !writeconcern.AckWrite(wc) {
+		sess = nil
 	}
 
-	res, err := driver.Insert(
-		ctx, cmd,
-		coll.client.topology,
-		coll.writeSelector,
-		coll.client.id,
-		coll.client.topology.SessionPool,
-		coll.client.retryWrites,
-		opts...,
-	)
-
-	switch err {
-	case nil:
-	case command.ErrUnacknowledgedWrite:
-		return &InsertManyResult{InsertedIDs: result}, ErrUnacknowledgedWrite
-	default:
-		return nil, replaceTopologyErr(err)
+	selector := coll.writeSelector
+	if sess != nil && sess.PinnedServer != nil {
+		selector = sess.PinnedServer
 	}
-	if len(res.WriteErrors) > 0 || res.WriteConcernError != nil {
-		bwErrors := make([]BulkWriteError, 0, len(res.WriteErrors))
-		for _, we := range res.WriteErrors {
-			bwErrors = append(bwErrors, BulkWriteError{
-				WriteError{
-					Index:   we.Index,
-					Code:    we.Code,
-					Message: we.ErrMsg,
-				},
-				nil,
-			})
+
+	op := operation.NewInsert(docs...).
+		Session(sess).WriteConcern(wc).CommandMonitor(coll.client.monitor).
+		ServerSelector(selector).ClusterClock(coll.client.clock).
+		Database(coll.db.name).Collection(coll.name).
+		Deployment(coll.client.topology)
+	imo := options.MergeInsertManyOptions(opts...)
+	if imo.BypassDocumentValidation != nil {
+		op = op.BypassDocumentValidation(*imo.BypassDocumentValidation)
+	}
+	if imo.Ordered != nil {
+		op = op.Ordered(*imo.Ordered)
+	}
+	retry := driver.RetryNone
+	if coll.client.retryWrites {
+		retry = driver.RetryOncePerCommand
+	}
+	op = op.Retry(retry)
+
+	return result, op.Execute(ctx)
+}
+
+// InsertOne inserts a single document into the collection.
+func (coll *Collection) InsertOne(ctx context.Context, document interface{},
+	opts ...*options.InsertOneOptions) (*InsertOneResult, error) {
+
+	imOpts := make([]*options.InsertManyOptions, len(opts))
+	for i, opt := range opts {
+		imo := options.InsertMany()
+		if opt.BypassDocumentValidation != nil {
+			imo = imo.SetBypassDocumentValidation(*opt.BypassDocumentValidation)
 		}
+		imOpts[i] = imo
+	}
+	res, err := coll.insert(ctx, []interface{}{document}, imOpts...)
 
-		err = BulkWriteException{
-			WriteErrors:       bwErrors,
-			WriteConcernError: convertWriteConcernError(res.WriteConcernError),
-		}
+	rr, err := processWriteError(nil, nil, err)
+	if rr&rrOne == 0 {
+		return nil, err
+	}
+	return &InsertOneResult{InsertedID: res[0]}, err
+}
+
+// InsertMany inserts the provided documents.
+func (coll *Collection) InsertMany(ctx context.Context, documents []interface{},
+	opts ...*options.InsertManyOptions) (*InsertManyResult, error) {
+
+	if len(documents) == 0 {
+		return nil, ErrEmptySlice
 	}
 
-	return &InsertManyResult{InsertedIDs: result}, err
+	result, err := coll.insert(ctx, documents, opts...)
+	rr, err := processWriteError(nil, nil, err)
+	if rr&rrMany == 0 {
+		return nil, err
+	}
+
+	imResult := &InsertManyResult{InsertedIDs: result}
+	writeException, ok := err.(WriteException)
+	if !ok {
+		return imResult, err
+	}
+
+	// create and return a BulkWriteException
+	bwErrors := make([]BulkWriteError, 0, len(writeException.WriteErrors))
+	for _, we := range writeException.WriteErrors {
+		bwErrors = append(bwErrors, BulkWriteError{
+			WriteError{
+				Index:   we.Index,
+				Code:    we.Code,
+				Message: we.Message,
+			},
+			nil,
+		})
+	}
+	return imResult, BulkWriteException{
+		WriteErrors:       bwErrors,
+		WriteConcernError: writeException.WriteConcernError,
+	}
 }
 
 // DeleteOne deletes a single document from the collection.
@@ -368,13 +355,13 @@ func (coll *Collection) DeleteOne(ctx context.Context, filter interface{},
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
 
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
 
@@ -387,7 +374,7 @@ func (coll *Collection) DeleteOne(ctx context.Context, filter interface{},
 		Clock:        coll.client.clock,
 	}
 
-	res, err := driver.Delete(
+	res, err := driverlegacy.Delete(
 		ctx, cmd,
 		coll.client.topology,
 		coll.writeSelector,
@@ -420,13 +407,13 @@ func (coll *Collection) DeleteMany(ctx context.Context, filter interface{},
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
 
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
 
@@ -439,7 +426,7 @@ func (coll *Collection) DeleteMany(ctx context.Context, filter interface{},
 		Clock:        coll.client.clock,
 	}
 
-	res, err := driver.Delete(
+	res, err := driverlegacy.Delete(
 		ctx, cmd,
 		coll.client.topology,
 		coll.writeSelector,
@@ -473,7 +460,7 @@ func (coll *Collection) updateOrReplaceOne(ctx context.Context, filter,
 	}
 
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
 
@@ -486,7 +473,7 @@ func (coll *Collection) updateOrReplaceOne(ctx context.Context, filter,
 		Clock:        coll.client.clock,
 	}
 
-	r, err := driver.Update(
+	r, err := driverlegacy.Update(
 		ctx, cmd,
 		coll.client.topology,
 		coll.writeSelector,
@@ -496,12 +483,13 @@ func (coll *Collection) updateOrReplaceOne(ctx context.Context, filter,
 		opts...,
 	)
 	if err != nil && err != command.ErrUnacknowledgedWrite {
-		return nil, replaceTopologyErr(err)
+		return nil, replaceErrors(err)
 	}
 
 	res := &UpdateResult{
 		MatchedCount:  r.MatchedCount,
 		ModifiedCount: r.ModifiedCount,
+		UpsertedCount: int64(len(r.Upserted)),
 	}
 	if len(r.Upserted) > 0 {
 		res.UpsertedID = r.Upserted[0].ID
@@ -539,7 +527,7 @@ func (coll *Collection) UpdateOne(ctx context.Context, filter interface{}, updat
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
@@ -579,13 +567,13 @@ func (coll *Collection) UpdateMany(ctx context.Context, filter interface{}, upda
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
 
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
 
@@ -598,7 +586,7 @@ func (coll *Collection) UpdateMany(ctx context.Context, filter interface{}, upda
 		Clock:        coll.client.clock,
 	}
 
-	r, err := driver.Update(
+	r, err := driverlegacy.Update(
 		ctx, cmd,
 		coll.client.topology,
 		coll.writeSelector,
@@ -608,11 +596,12 @@ func (coll *Collection) UpdateMany(ctx context.Context, filter interface{}, upda
 		opts...,
 	)
 	if err != nil && err != command.ErrUnacknowledgedWrite {
-		return nil, replaceTopologyErr(err)
+		return nil, replaceErrors(err)
 	}
 	res := &UpdateResult{
 		MatchedCount:  r.MatchedCount,
 		ModifiedCount: r.ModifiedCount,
+		UpsertedCount: int64(len(r.Upserted)),
 	}
 	// TODO(skriptble): Is this correct? Do we only return the first upserted ID for an UpdateMany?
 	if len(r.Upserted) > 0 {
@@ -651,7 +640,7 @@ func (coll *Collection) ReplaceOne(ctx context.Context, filter interface{},
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
@@ -672,107 +661,105 @@ func (coll *Collection) ReplaceOne(ctx context.Context, filter interface{},
 //
 // See https://docs.mongodb.com/manual/aggregation/.
 func (coll *Collection) Aggregate(ctx context.Context, pipeline interface{},
-	opts ...*options.AggregateOptions) (Cursor, error) {
+	opts ...*options.AggregateOptions) (*Cursor, error) {
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	pipelineArr, err := transformAggregatePipeline(coll.registry, pipeline)
+	pipelineArr, hasDollarOut, err := transformAggregatePipelinev2(coll.registry, pipeline)
 	if err != nil {
 		return nil, err
 	}
-
-	aggOpts := options.MergeAggregateOptions(opts...)
 
 	sess := sessionFromContext(ctx)
-
-	err = coll.client.ValidSession(sess)
-	if err != nil {
+	if sess == nil && coll.client.topology.SessionPool != nil {
+		sess, err = session.NewClientSession(coll.client.topology.SessionPool, coll.client.id, session.Implicit)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err = coll.client.validSession(sess); err != nil {
 		return nil, err
 	}
 
-	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	var wc *writeconcern.WriteConcern
+	if hasDollarOut {
+		wc = coll.writeConcern
+	}
+	rc := coll.readConcern
+	if sess.TransactionRunning() {
 		wc = nil
-	}
-
-	rc := coll.readConcern
-	if sess != nil && (sess.TransactionInProgress()) {
 		rc = nil
 	}
-
-	oldns := coll.namespace()
-	cmd := command.Aggregate{
-		NS:           command.Namespace{DB: oldns.DB, Collection: oldns.Collection},
-		Pipeline:     pipelineArr,
-		ReadPref:     coll.readPreference,
-		WriteConcern: wc,
-		ReadConcern:  rc,
-		Session:      sess,
-		Clock:        coll.client.clock,
+	if !writeconcern.AckWrite(wc) {
+		closeImplicitSession(sess)
+		sess = nil
 	}
 
-	cursor, err := driver.Aggregate(
-		ctx, cmd,
-		coll.client.topology,
-		coll.readSelector,
-		coll.writeSelector,
-		coll.client.id,
-		coll.client.topology.SessionPool,
-		coll.registry,
-		aggOpts,
-	)
-
-	return cursor, replaceTopologyErr(err)
-}
-
-// Count gets the number of documents matching the filter.
-func (coll *Collection) Count(ctx context.Context, filter interface{},
-	opts ...*options.CountOptions) (int64, error) {
-
-	if ctx == nil {
-		ctx = context.Background()
+	selector := coll.readSelector
+	if hasDollarOut {
+		selector = coll.writeSelector
+	}
+	if sess != nil && sess.PinnedServer != nil {
+		selector = sess.PinnedServer
 	}
 
-	f, err := transformDocument(coll.registry, filter)
+	ao := options.MergeAggregateOptions(opts...)
+	cursorOpts := driver.CursorOptions{
+		CommandMonitor: coll.client.monitor,
+	}
+
+	op := operation.NewAggregate(pipelineArr).Session(sess).WriteConcern(wc).ReadConcern(rc).ReadPreference(coll.readPreference).CommandMonitor(coll.client.monitor).
+		ServerSelector(selector).ClusterClock(coll.client.clock).Database(coll.db.name).Collection(coll.name).Deployment(coll.client.topology)
+	if ao.AllowDiskUse != nil {
+		op.AllowDiskUse(*ao.AllowDiskUse)
+	}
+	// ignore batchSize of 0 with $out
+	if ao.BatchSize != nil && !(*ao.BatchSize == 0 && hasDollarOut) {
+		op.BatchSize(*ao.BatchSize)
+		cursorOpts.BatchSize = *ao.BatchSize
+	}
+	if ao.BypassDocumentValidation != nil {
+		op.BypassDocumentValidation(*ao.BypassDocumentValidation)
+	}
+	if ao.Collation != nil {
+		op.Collation(bsoncore.Document(ao.Collation.ToDocument()))
+	}
+	if ao.MaxTime != nil {
+		op.MaxTimeMS(int64(*ao.MaxTime / time.Millisecond))
+	}
+	if ao.MaxAwaitTime != nil {
+		cursorOpts.MaxTimeMS = int64(*ao.MaxAwaitTime / time.Millisecond)
+	}
+	if ao.Comment != nil {
+		op.Comment(*ao.Comment)
+	}
+	if ao.Hint != nil {
+		hintVal, err := transformValue(coll.registry, ao.Hint)
+		if err != nil {
+			closeImplicitSession(sess)
+			return nil, err
+		}
+		op.Hint(hintVal)
+	}
+
+	err = op.Execute(ctx)
 	if err != nil {
-		return 0, err
+		closeImplicitSession(sess)
+		if wce, ok := err.(driver.WriteCommandError); ok && wce.WriteConcernError != nil {
+			return nil, *convertDriverWriteConcernError(wce.WriteConcernError)
+		}
+		return nil, replaceErrors(err)
 	}
 
-	sess := sessionFromContext(ctx)
-
-	err = coll.client.ValidSession(sess)
+	bc, err := op.Result(cursorOpts)
 	if err != nil {
-		return 0, err
+		closeImplicitSession(sess)
+		return nil, replaceErrors(err)
 	}
-
-	rc := coll.readConcern
-	if sess != nil && (sess.TransactionInProgress()) {
-		rc = nil
-	}
-
-	oldns := coll.namespace()
-	cmd := command.Count{
-		NS:          command.Namespace{DB: oldns.DB, Collection: oldns.Collection},
-		Query:       f,
-		ReadPref:    coll.readPreference,
-		ReadConcern: rc,
-		Session:     sess,
-		Clock:       coll.client.clock,
-	}
-
-	count, err := driver.Count(
-		ctx, cmd,
-		coll.client.topology,
-		coll.readSelector,
-		coll.client.id,
-		coll.client.topology.SessionPool,
-		coll.registry,
-		opts...,
-	)
-
-	return count, replaceTopologyErr(err)
+	cursor, err := newCursorWithSession(bc, coll.registry, sess)
+	return cursor, replaceErrors(err)
 }
 
 // CountDocuments gets the number of documents matching the filter.
@@ -792,13 +779,13 @@ func (coll *Collection) CountDocuments(ctx context.Context, filter interface{},
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return 0, err
 	}
 
 	rc := coll.readConcern
-	if sess != nil && (sess.TransactionInProgress()) {
+	if sess.TransactionRunning() {
 		rc = nil
 	}
 
@@ -812,7 +799,7 @@ func (coll *Collection) CountDocuments(ctx context.Context, filter interface{},
 		Clock:       coll.client.clock,
 	}
 
-	count, err := driver.CountDocuments(
+	count, err := driverlegacy.CountDocuments(
 		ctx, cmd,
 		coll.client.topology,
 		coll.readSelector,
@@ -822,7 +809,7 @@ func (coll *Collection) CountDocuments(ctx context.Context, filter interface{},
 		countOpts,
 	)
 
-	return count, replaceTopologyErr(err)
+	return count, replaceErrors(err)
 }
 
 // EstimatedDocumentCount gets an estimate of the count of documents in a collection using collection metadata.
@@ -835,7 +822,7 @@ func (coll *Collection) EstimatedDocumentCount(ctx context.Context,
 
 	sess := sessionFromContext(ctx)
 
-	err := coll.client.ValidSession(sess)
+	err := coll.client.validSession(sess)
 	if err != nil {
 		return 0, err
 	}
@@ -860,7 +847,7 @@ func (coll *Collection) EstimatedDocumentCount(ctx context.Context,
 		countOpts = countOpts.SetMaxTime(*opts[len(opts)-1].MaxTime)
 	}
 
-	count, err := driver.Count(
+	count, err := driverlegacy.Count(
 		ctx, cmd,
 		coll.client.topology,
 		coll.readSelector,
@@ -870,7 +857,7 @@ func (coll *Collection) EstimatedDocumentCount(ctx context.Context,
 		countOpts,
 	)
 
-	return count, replaceTopologyErr(err)
+	return count, replaceErrors(err)
 }
 
 // Distinct finds the distinct values for a specified field across a single
@@ -882,24 +869,20 @@ func (coll *Collection) Distinct(ctx context.Context, fieldName string, filter i
 		ctx = context.Background()
 	}
 
-	var f bsonx.Doc
-	var err error
-	if filter != nil {
-		f, err = transformDocument(coll.registry, filter)
-		if err != nil {
-			return nil, err
-		}
+	f, err := transformDocument(coll.registry, filter)
+	if err != nil {
+		return nil, err
 	}
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
 
 	rc := coll.readConcern
-	if sess != nil && (sess.TransactionInProgress()) {
+	if sess.TransactionRunning() {
 		rc = nil
 	}
 
@@ -914,7 +897,7 @@ func (coll *Collection) Distinct(ctx context.Context, fieldName string, filter i
 		Clock:       coll.client.clock,
 	}
 
-	res, err := driver.Distinct(
+	res, err := driverlegacy.Distinct(
 		ctx, cmd,
 		coll.client.topology,
 		coll.readSelector,
@@ -923,7 +906,7 @@ func (coll *Collection) Distinct(ctx context.Context, fieldName string, filter i
 		opts...,
 	)
 	if err != nil {
-		return nil, replaceTopologyErr(err)
+		return nil, replaceErrors(err)
 	}
 
 	return res.Values, nil
@@ -931,30 +914,26 @@ func (coll *Collection) Distinct(ctx context.Context, fieldName string, filter i
 
 // Find finds the documents matching a model.
 func (coll *Collection) Find(ctx context.Context, filter interface{},
-	opts ...*options.FindOptions) (Cursor, error) {
+	opts ...*options.FindOptions) (*Cursor, error) {
 
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
-	var f bsonx.Doc
-	var err error
-	if filter != nil {
-		f, err = transformDocument(coll.registry, filter)
-		if err != nil {
-			return nil, err
-		}
+	f, err := transformDocument(coll.registry, filter)
+	if err != nil {
+		return nil, err
 	}
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return nil, err
 	}
 
 	rc := coll.readConcern
-	if sess != nil && (sess.TransactionInProgress()) {
+	if sess.TransactionRunning() {
 		rc = nil
 	}
 
@@ -968,7 +947,7 @@ func (coll *Collection) Find(ctx context.Context, filter interface{},
 		Clock:       coll.client.clock,
 	}
 
-	cursor, err := driver.Find(
+	batchCursor, err := driverlegacy.Find(
 		ctx, cmd,
 		coll.client.topology,
 		coll.readSelector,
@@ -977,8 +956,12 @@ func (coll *Collection) Find(ctx context.Context, filter interface{},
 		coll.registry,
 		opts...,
 	)
+	if err != nil {
+		return nil, replaceErrors(err)
+	}
 
-	return cursor, replaceTopologyErr(err)
+	cursor, err := newCursor(batchCursor, coll.registry)
+	return cursor, replaceErrors(err)
 }
 
 // FindOne returns up to one document that matches the model.
@@ -989,24 +972,20 @@ func (coll *Collection) FindOne(ctx context.Context, filter interface{},
 		ctx = context.Background()
 	}
 
-	var f bsonx.Doc
-	var err error
-	if filter != nil {
-		f, err = transformDocument(coll.registry, filter)
-		if err != nil {
-			return &SingleResult{err: err}
-		}
+	f, err := transformDocument(coll.registry, filter)
+	if err != nil {
+		return &SingleResult{err: err}
 	}
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return &SingleResult{err: err}
 	}
 
 	rc := coll.readConcern
-	if sess != nil && (sess.TransactionInProgress()) {
+	if sess.TransactionRunning() {
 		rc = nil
 	}
 
@@ -1043,7 +1022,7 @@ func (coll *Collection) FindOne(ctx context.Context, filter interface{},
 		}
 	}
 
-	cursor, err := driver.Find(
+	batchCursor, err := driverlegacy.Find(
 		ctx, cmd,
 		coll.client.topology,
 		coll.readSelector,
@@ -1053,10 +1032,11 @@ func (coll *Collection) FindOne(ctx context.Context, filter interface{},
 		findOpts...,
 	)
 	if err != nil {
-		return &SingleResult{err: replaceTopologyErr(err)}
+		return &SingleResult{err: replaceErrors(err)}
 	}
 
-	return &SingleResult{cur: cursor, reg: coll.registry}
+	cursor, err := newCursor(batchCursor, coll.registry)
+	return &SingleResult{cur: cursor, reg: coll.registry, err: replaceErrors(err)}
 }
 
 // FindOneAndDelete find a single document and deletes it, returning the
@@ -1068,25 +1048,21 @@ func (coll *Collection) FindOneAndDelete(ctx context.Context, filter interface{}
 		ctx = context.Background()
 	}
 
-	var f bsonx.Doc
-	var err error
-	if filter != nil {
-		f, err = transformDocument(coll.registry, filter)
-		if err != nil {
-			return &SingleResult{err: err}
-		}
+	f, err := transformDocument(coll.registry, filter)
+	if err != nil {
+		return &SingleResult{err: err}
 	}
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return &SingleResult{err: err}
 	}
 
 	oldns := coll.namespace()
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
 
@@ -1098,7 +1074,7 @@ func (coll *Collection) FindOneAndDelete(ctx context.Context, filter interface{}
 		Clock:        coll.client.clock,
 	}
 
-	res, err := driver.FindOneAndDelete(
+	res, err := driverlegacy.FindOneAndDelete(
 		ctx, cmd,
 		coll.client.topology,
 		coll.writeSelector,
@@ -1108,8 +1084,13 @@ func (coll *Collection) FindOneAndDelete(ctx context.Context, filter interface{}
 		coll.registry,
 		opts...,
 	)
+
 	if err != nil {
-		return &SingleResult{err: replaceTopologyErr(err)}
+		return &SingleResult{err: replaceErrors(err)}
+	}
+
+	if res.WriteConcernError != nil {
+		return &SingleResult{err: *convertWriteConcernError(res.WriteConcernError)}
 	}
 
 	return &SingleResult{rdr: res.Value, reg: coll.registry}
@@ -1140,13 +1121,13 @@ func (coll *Collection) FindOneAndReplace(ctx context.Context, filter interface{
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return &SingleResult{err: err}
 	}
 
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
 
@@ -1160,7 +1141,7 @@ func (coll *Collection) FindOneAndReplace(ctx context.Context, filter interface{
 		Clock:        coll.client.clock,
 	}
 
-	res, err := driver.FindOneAndReplace(
+	res, err := driverlegacy.FindOneAndReplace(
 		ctx, cmd,
 		coll.client.topology,
 		coll.writeSelector,
@@ -1171,7 +1152,11 @@ func (coll *Collection) FindOneAndReplace(ctx context.Context, filter interface{
 		opts...,
 	)
 	if err != nil {
-		return &SingleResult{err: replaceTopologyErr(err)}
+		return &SingleResult{err: replaceErrors(err)}
+	}
+
+	if res.WriteConcernError != nil {
+		return &SingleResult{err: *convertWriteConcernError(res.WriteConcernError)}
 	}
 
 	return &SingleResult{rdr: res.Value, reg: coll.registry}
@@ -1196,19 +1181,22 @@ func (coll *Collection) FindOneAndUpdate(ctx context.Context, filter interface{}
 		return &SingleResult{err: err}
 	}
 
-	if len(u) > 0 && !strings.HasPrefix(u[0].Key, "$") {
-		return &SingleResult{err: errors.New("update document must contain key beginning with '$")}
+	err = ensureDollarKey(u)
+	if err != nil {
+		return &SingleResult{
+			err: err,
+		}
 	}
 
 	sess := sessionFromContext(ctx)
 
-	err = coll.client.ValidSession(sess)
+	err = coll.client.validSession(sess)
 	if err != nil {
 		return &SingleResult{err: err}
 	}
 
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
 
@@ -1222,7 +1210,7 @@ func (coll *Collection) FindOneAndUpdate(ctx context.Context, filter interface{}
 		Clock:        coll.client.clock,
 	}
 
-	res, err := driver.FindOneAndUpdate(
+	res, err := driverlegacy.FindOneAndUpdate(
 		ctx, cmd,
 		coll.client.topology,
 		coll.writeSelector,
@@ -1233,7 +1221,11 @@ func (coll *Collection) FindOneAndUpdate(ctx context.Context, filter interface{}
 		opts...,
 	)
 	if err != nil {
-		return &SingleResult{err: replaceTopologyErr(err)}
+		return &SingleResult{err: replaceErrors(err)}
+	}
+
+	if res.WriteConcernError != nil {
+		return &SingleResult{err: *convertWriteConcernError(res.WriteConcernError)}
 	}
 
 	return &SingleResult{rdr: res.Value, reg: coll.registry}
@@ -1245,7 +1237,7 @@ func (coll *Collection) FindOneAndUpdate(ctx context.Context, filter interface{}
 // supports resumability in the case of some errors. The collection must have read concern majority or no read concern
 // for a change stream to be created successfully.
 func (coll *Collection) Watch(ctx context.Context, pipeline interface{},
-	opts ...*options.ChangeStreamOptions) (Cursor, error) {
+	opts ...*options.ChangeStreamOptions) (*ChangeStream, error) {
 	return newChangeStream(ctx, coll, pipeline, opts...)
 }
 
@@ -1262,13 +1254,13 @@ func (coll *Collection) Drop(ctx context.Context) error {
 
 	sess := sessionFromContext(ctx)
 
-	err := coll.client.ValidSession(sess)
+	err := coll.client.validSession(sess)
 	if err != nil {
 		return err
 	}
 
 	wc := coll.writeConcern
-	if sess != nil && sess.TransactionRunning() {
+	if sess.TransactionRunning() {
 		wc = nil
 	}
 
@@ -1279,7 +1271,7 @@ func (coll *Collection) Drop(ctx context.Context) error {
 		Session:      sess,
 		Clock:        coll.client.clock,
 	}
-	_, err = driver.DropCollection(
+	_, err = driverlegacy.DropCollection(
 		ctx, cmd,
 		coll.client.topology,
 		coll.writeSelector,
@@ -1287,7 +1279,7 @@ func (coll *Collection) Drop(ctx context.Context) error {
 		coll.client.topology.SessionPool,
 	)
 	if err != nil && !command.IsNotFound(err) {
-		return replaceTopologyErr(err)
+		return replaceErrors(err)
 	}
 	return nil
 }

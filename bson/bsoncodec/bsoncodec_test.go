@@ -7,12 +7,44 @@
 package bsoncodec
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
-	"github.com/mongodb/mongo-go-driver/bson/bsonrw"
-	"github.com/mongodb/mongo-go-driver/bson/decimal"
+	"go.mongodb.org/mongo-driver/bson/bsonrw"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+func ExampleValueEncoder() {
+	var _ ValueEncoderFunc = func(ec EncodeContext, vw bsonrw.ValueWriter, val reflect.Value) error {
+		if val.Kind() != reflect.String {
+			return ValueEncoderError{Name: "StringEncodeValue", Kinds: []reflect.Kind{reflect.String}, Received: val}
+		}
+
+		return vw.WriteString(val.String())
+	}
+}
+
+func ExampleValueDecoder() {
+	var _ ValueDecoderFunc = func(dc DecodeContext, vr bsonrw.ValueReader, val reflect.Value) error {
+		if !val.CanSet() || val.Kind() != reflect.String {
+			return ValueDecoderError{Name: "StringDecodeValue", Kinds: []reflect.Kind{reflect.String}, Received: val}
+		}
+
+		if vr.Type() != bsontype.String {
+			return fmt.Errorf("cannot decode %v into a string type", vr.Type())
+		}
+
+		str, err := vr.ReadString()
+		if err != nil {
+			return err
+		}
+		val.SetString(str)
+		return nil
+	}
+}
 
 func noerr(t *testing.T, err error) {
 	if err != nil {
@@ -20,6 +52,13 @@ func noerr(t *testing.T, err error) {
 		t.Errorf("Unexpected error: (%T)%v", err, err)
 		t.FailNow()
 	}
+}
+
+func compareTime(t1, t2 time.Time) bool {
+	if t1.Location() != t2.Location() {
+		return false
+	}
+	return t1.Equal(t2)
 }
 
 func compareErrors(err1, err2 error) bool {
@@ -38,7 +77,7 @@ func compareErrors(err1, err2 error) bool {
 	return true
 }
 
-func compareDecimal128(d1, d2 decimal.Decimal128) bool {
+func compareDecimal128(d1, d2 primitive.Decimal128) bool {
 	d1H, d1L := d1.GetBytes()
 	d2H, d2L := d2.GetBytes()
 
@@ -91,22 +130,16 @@ func (llc *llCodec) EncodeValue(_ EncodeContext, _ bsonrw.ValueWriter, i interfa
 	return nil
 }
 
-func (llc *llCodec) DecodeValue(_ DecodeContext, _ bsonrw.ValueReader, i interface{}) error {
+func (llc *llCodec) DecodeValue(_ DecodeContext, _ bsonrw.ValueReader, val reflect.Value) error {
 	if llc.err != nil {
 		return llc.err
 	}
 
-	val := reflect.ValueOf(i)
-	if val.Type().Kind() != reflect.Ptr {
-		llc.t.Errorf("Value provided to DecodeValue must be a pointer, but got %T", i)
+	if !reflect.TypeOf(llc.decodeval).AssignableTo(val.Type()) {
+		llc.t.Errorf("decodeval must be assignable to val provided to DecodeValue, but is not. decodeval %T; val %T", llc.decodeval, val)
 		return nil
 	}
 
-	if !reflect.TypeOf(llc.decodeval).AssignableTo(val.Type().Elem()) {
-		llc.t.Errorf("decodeval must be assignable to i provided to DecodeValue, but is not. decodeval %T; i %T", llc.decodeval, i)
-		return nil
-	}
-
-	val.Elem().Set(reflect.ValueOf(llc.decodeval))
+	val.Set(reflect.ValueOf(llc.decodeval))
 	return nil
 }

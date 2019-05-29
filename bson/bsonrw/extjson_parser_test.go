@@ -7,11 +7,12 @@
 package bsonrw
 
 import (
+	"io"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/mongodb/mongo-go-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
 )
 
 var (
@@ -19,6 +20,7 @@ var (
 	typDiff = specificDiff("type")
 	valDiff = specificDiff("value")
 
+	expectErrEOF = expectSpecificError(io.EOF)
 	expectErrEOD = expectSpecificError(ErrEOD)
 	expectErrEOA = expectSpecificError(ErrEOA)
 )
@@ -123,6 +125,7 @@ func TestExtJSONParserPeekType(t *testing.T) {
 		makeValidPeekTypeTestCase(`{"$binary": {"base64": "AQIDBAU=", "subType": "80"}}`, bsontype.Binary, "Binary"),
 		makeValidPeekTypeTestCase(`{"$code": "function() {}", "$scope": {}}`, bsontype.CodeWithScope, "Code With Scope"),
 		makeValidPeekTypeTestCase(`{"$binary": {"base64": "o0w498Or7cijeBSpkquNtg==", "subType": "03"}}`, bsontype.Binary, "Binary"),
+		makeValidPeekTypeTestCase(`{"$binary": "o0w498Or7cijeBSpkquNtg==", "$type": "03"}`, bsontype.Binary, "Binary"),
 		makeValidPeekTypeTestCase(`{"$regularExpression": {"pattern": "foo*", "options": "ix"}}`, bsontype.Regex, "Regular expression"),
 		makeValidPeekTypeTestCase(`{"$dbPointer": {"$ref": "db.collection", "$id": {"$oid": "57e193d7a9cc81b4027498b1"}}}`, bsontype.DBPointer, "DBPointer"),
 		makeValidPeekTypeTestCase(`{"$ref": "collection", "$id": {"$oid": "57fd71e96e32ab4225b723fb"}, "$db": "database"}`, bsontype.EmbeddedDocument, "DBRef"),
@@ -342,8 +345,8 @@ func expectMultipleValues(t *testing.T, p *extJSONParser, expectedKey string, ex
 	readKeyDiff(t, expectedKey, k, expectedType, typ, err, expectNoError, expectedKey)
 
 	v, err := p.readValue(typ)
-	typDiff(t, bsontype.EmbeddedDocument, v.t, expectedKey)
 	expectNoError(t, err, "")
+	typDiff(t, bsontype.EmbeddedDocument, v.t, expectedKey)
 
 	actObj := v.v.(*extJSONObject)
 	expObj := expectedValue.(*extJSONObject)
@@ -443,13 +446,14 @@ func TestExtJSONParserAllTypes(t *testing.T) {
 			, "SpecialFloat"		: { "$numberDouble": "NaN" }
 			, "Decimal"				: { "$numberDecimal": "1234" }
 			, "Binary"			 	: { "$binary": { "base64": "o0w498Or7cijeBSpkquNtg==", "subType": "03" } }
+			, "BinaryLegacy"  : { "$binary": "o0w498Or7cijeBSpkquNtg==", "$type": "03" }
 			, "BinaryUserDefined"	: { "$binary": { "base64": "AQIDBAU=", "subType": "80" } }
 			, "Code"				: { "$code": "function() {}" }
 			, "CodeWithEmptyScope"	: { "$code": "function() {}", "$scope": {} }
 			, "CodeWithScope"		: { "$code": "function() {}", "$scope": { "x": 1 } }
 			, "EmptySubdocument"    : {}
 			, "Subdocument"			: { "foo": "bar", "baz": { "$numberInt": "42" } }
-			, "Array"				: [{"$numberInt": "1"}, {"$numberLong": "2"}, {"$numberDouble": "3"}, 4, 5.0]
+			, "Array"				: [{"$numberInt": "1"}, {"$numberLong": "2"}, {"$numberDouble": "3"}, 4, "string", 5.0]
 			, "Timestamp"			: { "$timestamp": { "t": 42, "i": 1 } }
 			, "RegularExpression"	: { "$regularExpression": { "pattern": "foo*", "options": "ix" } }
 			, "DatetimeEpoch"		: { "$date": { "$numberLong": "0" } }
@@ -504,6 +508,17 @@ func TestExtJSONParserAllTypes(t *testing.T) {
 		{
 			f: expectMultipleValues, p: ejp,
 			k: "Binary", t: bsontype.Binary,
+			v: &extJSONObject{
+				keys: []string{"base64", "subType"},
+				values: []*extJSONValue{
+					{t: bsontype.String, v: "o0w498Or7cijeBSpkquNtg=="},
+					{t: bsontype.String, v: "03"},
+				},
+			},
+		},
+		{
+			f: expectMultipleValues, p: ejp,
+			k: "BinaryLegacy", t: bsontype.Binary,
 			v: &extJSONObject{
 				keys: []string{"base64", "subType"},
 				values: []*extJSONValue{
@@ -570,6 +585,7 @@ func TestExtJSONParserAllTypes(t *testing.T) {
 				{typ: bsontype.Int64, val: &extJSONValue{t: bsontype.String, v: "2"}},
 				{typ: bsontype.Double, val: &extJSONValue{t: bsontype.String, v: "3"}},
 				{typ: bsontype.Int32, val: &extJSONValue{t: bsontype.Int32, v: int32(4)}},
+				{typ: bsontype.String, val: &extJSONValue{t: bsontype.String, v: "string"}},
 				{typ: bsontype.Double, val: &extJSONValue{t: bsontype.Double, v: 5.0}},
 			},
 		},
@@ -694,9 +710,27 @@ func TestExtJSONParserAllTypes(t *testing.T) {
 
 	// expect end of whole document: read EOF
 	k, typ, err = ejp.readKey()
-	readKeyDiff(t, "", k, bsontype.Type(0), typ, err, expectErrEOD, "")
+	readKeyDiff(t, "", k, bsontype.Type(0), typ, err, expectErrEOF, "")
 	if diff := cmp.Diff(jpsDoneState, ejp.s); diff != "" {
 		t.Errorf("expected parser to be in done state but instead is in %v\n", ejp.s)
 		t.FailNow()
 	}
+}
+
+func TestExtJSONValue(t *testing.T) {
+	t.Run("Large Date", func(t *testing.T) {
+		val := &extJSONValue{
+			t: bsontype.String,
+			v: "3001-01-01T00:00:00Z",
+		}
+
+		intVal, err := val.parseDateTime()
+		if err != nil {
+			t.Fatalf("error parsing date time: %v", err)
+		}
+
+		if intVal <= 0 {
+			t.Fatalf("expected value above 0, got %v", intVal)
+		}
+	})
 }

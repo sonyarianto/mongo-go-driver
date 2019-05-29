@@ -9,20 +9,21 @@ package testutil
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
-	"github.com/mongodb/mongo-go-driver/event"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/topology"
-	"github.com/mongodb/mongo-go-driver/x/network/command"
-	"github.com/mongodb/mongo-go-driver/x/network/connection"
-	"github.com/mongodb/mongo-go-driver/x/network/connstring"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
 	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/event"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/x/network/command"
 )
 
 var connectionString connstring.ConnString
@@ -84,10 +85,10 @@ func MonitoredTopology(t *testing.T, dbName string, monitor *event.CommandMonito
 		topology.WithServerOptions(func(opts ...topology.ServerOption) []topology.ServerOption {
 			return append(
 				opts,
-				topology.WithConnectionOptions(func(opts ...connection.Option) []connection.Option {
+				topology.WithConnectionOptions(func(opts ...topology.ConnectionOption) []topology.ConnectionOption {
 					return append(
 						opts,
-						connection.WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
+						topology.WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
 							return monitor
 						}),
 					)
@@ -100,11 +101,11 @@ func MonitoredTopology(t *testing.T, dbName string, monitor *event.CommandMonito
 	if err != nil {
 		t.Fatal(err)
 	} else {
-		monitoredTopology.Connect(context.Background())
-		s, err := monitoredTopology.SelectServer(context.Background(), description.WriteSelector())
+		monitoredTopology.Connect()
+		s, err := monitoredTopology.SelectServerLegacy(context.Background(), description.WriteSelector())
 		require.NoError(t, err)
 
-		c, err := s.Connection(context.Background())
+		c, err := s.ConnectionLegacy(context.Background())
 		require.NoError(t, err)
 
 		_, err = (&command.Write{
@@ -126,10 +127,10 @@ func GlobalMonitoredTopology(t *testing.T, monitor *event.CommandMonitor) *topol
 		topology.WithServerOptions(func(opts ...topology.ServerOption) []topology.ServerOption {
 			return append(
 				opts,
-				topology.WithConnectionOptions(func(opts ...connection.Option) []connection.Option {
+				topology.WithConnectionOptions(func(opts ...topology.ConnectionOption) []topology.ConnectionOption {
 					return append(
 						opts,
-						connection.WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
+						topology.WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
 							return monitor
 						}),
 					)
@@ -144,11 +145,11 @@ func GlobalMonitoredTopology(t *testing.T, monitor *event.CommandMonitor) *topol
 		if err != nil {
 			monitoredTopologyErr = err
 		} else {
-			monitoredTopology.Connect(context.Background())
-			s, err := monitoredTopology.SelectServer(context.Background(), description.WriteSelector())
+			monitoredTopology.Connect()
+			s, err := monitoredTopology.SelectServerLegacy(context.Background(), description.WriteSelector())
 			require.NoError(t, err)
 
-			c, err := s.Connection(context.Background())
+			c, err := s.ConnectionLegacy(context.Background())
 			require.NoError(t, err)
 
 			_, err = (&command.Write{
@@ -176,11 +177,11 @@ func Topology(t *testing.T) *topology.Topology {
 		if err != nil {
 			liveTopologyErr = err
 		} else {
-			liveTopology.Connect(context.Background())
-			s, err := liveTopology.SelectServer(context.Background(), description.WriteSelector())
+			liveTopology.Connect()
+			s, err := liveTopology.SelectServerLegacy(context.Background(), description.WriteSelector())
 			require.NoError(t, err)
 
-			c, err := s.Connection(context.Background())
+			c, err := s.ConnectionLegacy(context.Background())
 			require.NoError(t, err)
 
 			_, err = (&command.Write{
@@ -205,7 +206,7 @@ func TopologyWithConnString(t *testing.T, cs connstring.ConnString) *topology.To
 	if err != nil {
 		t.Fatal("Could not construct topology")
 	}
-	err = topology.Connect(context.Background())
+	err = topology.Connect()
 	if err != nil {
 		t.Fatal("Could not start topology connection")
 	}
@@ -282,4 +283,30 @@ func Integration(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test in short mode")
 	}
+}
+
+// compareVersions compares two version number strings (i.e. positive integers separated by
+// periods). Comparisons are done to the lesser precision of the two versions. For example, 3.2 is
+// considered equal to 3.2.11, whereas 3.2.0 is considered less than 3.2.11.
+//
+// Returns a positive int if version1 is greater than version2, a negative int if version1 is less
+// than version2, and 0 if version1 is equal to version2.
+func CompareVersions(t *testing.T, v1 string, v2 string) int {
+	n1 := strings.Split(v1, ".")
+	n2 := strings.Split(v2, ".")
+
+	for i := 0; i < int(math.Min(float64(len(n1)), float64(len(n2)))); i++ {
+		i1, err := strconv.Atoi(n1[i])
+		require.NoError(t, err)
+
+		i2, err := strconv.Atoi(n2[i])
+		require.NoError(t, err)
+
+		difference := i1 - i2
+		if difference != 0 {
+			return difference
+		}
+	}
+
+	return 0
 }

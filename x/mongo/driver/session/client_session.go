@@ -4,17 +4,18 @@
 // not use this file except in compliance with the License. You may obtain
 // a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 
-package session
+package session // import "go.mongodb.org/mongo-driver/x/mongo/driver/session"
 
 import (
 	"errors"
 
-	"github.com/mongodb/mongo-go-driver/bson/primitive"
-	"github.com/mongodb/mongo-go-driver/mongo/readconcern"
-	"github.com/mongodb/mongo-go-driver/mongo/readpref"
-	"github.com/mongodb/mongo-go-driver/mongo/writeconcern"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/uuid"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/uuid"
 )
 
 // ErrSessionEnded is returned when a client session is used after a call to endSession().
@@ -63,7 +64,7 @@ const (
 type Client struct {
 	*Server
 	ClientID       uuid.UUID
-	ClusterTime    bsonx.Doc
+	ClusterTime    bson.Raw
 	Consistent     bool // causal consistency
 	OperationTime  *primitive.Timestamp
 	SessionType    Type
@@ -84,11 +85,13 @@ type Client struct {
 	transactionRp *readpref.ReadPref
 	transactionWc *writeconcern.WriteConcern
 
-	pool  *Pool
-	state state
+	pool          *Pool
+	state         state
+	PinnedServer  *description.Server
+	RecoveryToken bson.Raw
 }
 
-func getClusterTime(clusterTime bsonx.Doc) (uint32, uint32) {
+func getClusterTime(clusterTime bson.Raw) (uint32, uint32) {
 	if clusterTime == nil {
 		return 0, 0
 	}
@@ -98,7 +101,7 @@ func getClusterTime(clusterTime bsonx.Doc) (uint32, uint32) {
 		return 0, 0
 	}
 
-	timestampVal, err := clusterTimeVal.Document().LookupErr("clusterTime")
+	timestampVal, err := bson.Raw(clusterTimeVal.Value).LookupErr("clusterTime")
 	if err != nil {
 		return 0, 0
 	}
@@ -107,7 +110,7 @@ func getClusterTime(clusterTime bsonx.Doc) (uint32, uint32) {
 }
 
 // MaxClusterTime compares 2 clusterTime documents and returns the document representing the highest cluster time.
-func MaxClusterTime(ct1 bsonx.Doc, ct2 bsonx.Doc) bsonx.Doc {
+func MaxClusterTime(ct1, ct2 bson.Raw) bson.Raw {
 	epoch1, ord1 := getClusterTime(ct1)
 	epoch2, ord2 := getClusterTime(ct2)
 
@@ -158,7 +161,7 @@ func NewClientSession(pool *Pool, clientID uuid.UUID, sessionType Type, opts ...
 }
 
 // AdvanceClusterTime updates the session's cluster time.
-func (c *Client) AdvanceClusterTime(clusterTime bsonx.Doc) error {
+func (c *Client) AdvanceClusterTime(clusterTime bson.Raw) error {
 	if c.Terminated {
 		return ErrSessionEnded
 	}
@@ -196,6 +199,27 @@ func (c *Client) UpdateUseTime() error {
 	return nil
 }
 
+// UpdateRecoveryToken updates the session's recovery token from the server response.
+func (c *Client) UpdateRecoveryToken(response bson.Raw) {
+	if c == nil {
+		return
+	}
+
+	token, err := response.LookupErr("recoveryToken")
+	if err != nil {
+		return
+	}
+
+	c.RecoveryToken = token.Document()
+}
+
+// ClearPinnedServer sets the PinnedServer to nil.
+func (c *Client) ClearPinnedServer() {
+	if c != nil {
+		c.PinnedServer = nil
+	}
+}
+
 // EndSession ends the session.
 func (c *Client) EndSession() {
 	if c.Terminated {
@@ -221,7 +245,7 @@ func (c *Client) TransactionStarting() bool {
 // TransactionRunning returns true if the client session has started the transaction
 // and it hasn't been committed or aborted
 func (c *Client) TransactionRunning() bool {
-	return c.state == Starting || c.state == InProgress
+	return c != nil && (c.state == Starting || c.state == InProgress)
 }
 
 // TransactionCommitted returns true of the client session just committed a transaciton.
@@ -273,6 +297,7 @@ func (c *Client) StartTransaction(opts *TransactionOptions) error {
 	}
 
 	c.state = Starting
+	c.PinnedServer = nil
 	return nil
 }
 
@@ -311,7 +336,7 @@ func (c *Client) CheckAbortTransaction() error {
 	return nil
 }
 
-// AbortTransaction updates the state for a successfully committed transaction and returns
+// AbortTransaction updates the state for a successfully aborted transaction and returns
 // an error if not permissible.  It does not actually perform the abort.
 func (c *Client) AbortTransaction() error {
 	err := c.CheckAbortTransaction()
@@ -324,13 +349,17 @@ func (c *Client) AbortTransaction() error {
 }
 
 // ApplyCommand advances the state machine upon command execution.
-func (c *Client) ApplyCommand() {
+func (c *Client) ApplyCommand(desc description.Server) {
 	if c.Committing {
 		// Do not change state if committing after already committed
 		return
 	}
 	if c.state == Starting {
 		c.state = InProgress
+		// If this is in a transaction and the server is a mongos, pin it
+		if desc.Kind == description.Mongos {
+			c.PinnedServer = &desc
+		}
 	} else if c.state == Committed || c.state == Aborted {
 		c.clearTransactionOpts()
 		c.state = None
@@ -344,4 +373,6 @@ func (c *Client) clearTransactionOpts() {
 	c.CurrentWc = nil
 	c.CurrentRp = nil
 	c.CurrentRc = nil
+	c.PinnedServer = nil
+	c.RecoveryToken = nil
 }

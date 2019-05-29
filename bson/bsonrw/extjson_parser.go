@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/mongodb/mongo-go-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
 )
 
 const maxNestingDepth = 200
@@ -163,10 +163,12 @@ func (ejp *extJSONParser) readKey() (string, bsontype.Type, error) {
 	case jpsSawValue, jpsSawEndObject, jpsSawEndArray:
 		ejp.advanceState()
 		switch ejp.s {
-		case jpsSawComma:
+		case jpsSawBeginObject, jpsSawComma:
 			ejp.advanceState()
-		case jpsSawEndObject, jpsDoneState:
+		case jpsSawEndObject:
 			return "", 0, ErrEOD
+		case jpsDoneState:
+			return "", 0, io.EOF
 		case jpsInvalidState:
 			return "", 0, ejp.err
 		default:
@@ -262,8 +264,51 @@ func (ejp *extJSONParser) readValue(t bsontype.Type) (*extJSONValue, error) {
 			return nil, err
 		}
 
+		ejp.advanceState()
+		if t == bsontype.Binary && ejp.s == jpsSawValue {
+			// convert legacy $binary format
+			base64 := ejp.v
+
+			ejp.advanceState()
+			if ejp.s != jpsSawComma {
+				return nil, invalidJSONErrorForType(",", bsontype.Binary)
+			}
+
+			ejp.advanceState()
+			key, t, err := ejp.readKey()
+			if err != nil {
+				return nil, err
+			}
+			if key != "$type" {
+				return nil, invalidJSONErrorForType("$type", bsontype.Binary)
+			}
+
+			subType, err := ejp.readValue(t)
+			if err != nil {
+				return nil, err
+			}
+
+			ejp.advanceState()
+			if ejp.s != jpsSawEndObject {
+				return nil, invalidJSONErrorForType("2 key-value pairs and then }", bsontype.Binary)
+			}
+
+			v = &extJSONValue{
+				t: bsontype.EmbeddedDocument,
+				v: &extJSONObject{
+					keys:   []string{"base64", "subType"},
+					values: []*extJSONValue{base64, subType},
+				},
+			}
+			break
+		}
+
 		// read KV pairs
-		keys, vals, err := ejp.readObject(2, false)
+		if ejp.s != jpsSawBeginObject {
+			return nil, invalidJSONErrorForType("{", t)
+		}
+
+		keys, vals, err := ejp.readObject(2, true)
 		if err != nil {
 			return nil, err
 		}
@@ -274,6 +319,7 @@ func (ejp *extJSONParser) readValue(t bsontype.Type) (*extJSONValue, error) {
 		}
 
 		v = &extJSONValue{t: bsontype.EmbeddedDocument, v: &extJSONObject{keys: keys, values: vals}}
+
 	case bsontype.DateTime:
 		switch ejp.s {
 		case jpsSawValue:
@@ -466,7 +512,14 @@ func (ejp *extJSONParser) advanceState() {
 		}
 	case jttString:
 		switch ejp.s {
-		case jpsSawBeginObject, jpsSawComma:
+		case jpsSawComma:
+			if ejp.peekMode() == jpmArrayMode {
+				ejp.s = jpsSawValue
+				ejp.v = extendJSONToken(jt)
+				return
+			}
+			fallthrough
+		case jpsSawBeginObject:
 			ejp.s = jpsSawKey
 			ejp.k = jt.v.(string)
 			return
@@ -552,6 +605,12 @@ var jpsValidTransitionTokens = map[jsonParseState]map[jsonTokenType]bool{
 
 func (ejp *extJSONParser) validateToken(jtt jsonTokenType) bool {
 	switch ejp.s {
+	case jpsSawEndObject:
+		// if we are at depth zero and the next token is a '{',
+		// we can consider it valid only if we are not in array mode.
+		if jtt == jttBeginObject && ejp.depth == 0 {
+			return ejp.peekMode() != jpmArrayMode
+		}
 	case jpsSawComma:
 		switch ejp.peekMode() {
 		// the only valid next token after a comma inside a document is a string (a key)
@@ -560,13 +619,10 @@ func (ejp *extJSONParser) validateToken(jtt jsonTokenType) bool {
 		case jpmInvalidMode:
 			return false
 		}
-
-		// fallthrough for commas in arrays
-		fallthrough
-	default:
-		_, ok := jpsValidTransitionTokens[ejp.s][jtt]
-		return ok
 	}
+
+	_, ok := jpsValidTransitionTokens[ejp.s][jtt]
+	return ok
 }
 
 // ensureExtValueType returns true if the current value has the expected

@@ -9,12 +9,12 @@ package command
 import (
 	"context"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/session"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
-	"github.com/mongodb/mongo-go-driver/x/network/result"
-	"github.com/mongodb/mongo-go-driver/x/network/wiremessage"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/x/network/result"
+	"go.mongodb.org/mongo-driver/x/network/wiremessage"
 )
 
 // CommitTransaction represents the commitTransaction() command
@@ -32,6 +32,10 @@ func (ct *CommitTransaction) Encode(desc description.SelectedServer) (wiremessag
 
 func (ct *CommitTransaction) encode(desc description.SelectedServer) *Write {
 	cmd := bsonx.Doc{{"commitTransaction", bsonx.Int32(1)}}
+	if ct.Session.RecoveryToken != nil {
+		tokenDoc, _ := bsonx.ReadDoc(ct.Session.RecoveryToken)
+		cmd = append(cmd, bsonx.Elem{"recoveryToken", bsonx.Document(tokenDoc)})
+	}
 	return &Write{
 		DB:           "admin",
 		Command:      cmd,
@@ -56,6 +60,7 @@ func (ct *CommitTransaction) decode(desc description.SelectedServer, rdr bson.Ra
 	ct.err = bson.Unmarshal(rdr, &ct.result)
 	if ct.err == nil && ct.result.WriteConcernError != nil {
 		ct.err = Error{
+			Name:    ct.result.WriteConcernError.Name,
 			Code:    int32(ct.result.WriteConcernError.Code),
 			Message: ct.result.WriteConcernError.ErrMsg,
 		}

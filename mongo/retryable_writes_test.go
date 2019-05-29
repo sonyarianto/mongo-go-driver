@@ -20,19 +20,18 @@ import (
 
 	"sync"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/event"
-	"github.com/mongodb/mongo-go-driver/internal/testutil"
-	"github.com/mongodb/mongo-go-driver/internal/testutil/helpers"
-	"github.com/mongodb/mongo-go-driver/mongo/options"
-	"github.com/mongodb/mongo-go-driver/mongo/readpref"
-	"github.com/mongodb/mongo-go-driver/mongo/writeconcern"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/session"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/topology"
-	"github.com/mongodb/mongo-go-driver/x/network/connection"
-	"github.com/mongodb/mongo-go-driver/x/network/connstring"
 	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/event"
+	"go.mongodb.org/mongo-driver/internal/testutil"
+	testhelpers "go.mongodb.org/mongo-driver/internal/testutil/helpers"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 )
 
 const retryWritesDir = "../data/retryable-writes"
@@ -142,7 +141,7 @@ func TestTxnNumberIncluded(t *testing.T) {
 			if tc.includesTxn {
 				require.NotNil(t, evt.Command.Lookup("txnNumber"))
 			} else {
-				require.Equal(t, evt.Command.Lookup("txnNumber"), bsonx.Val{})
+				require.Equal(t, evt.Command.Lookup("txnNumber"), bson.RawValue{})
 			}
 		})
 	}
@@ -342,6 +341,7 @@ func createRetryMonitoredClient(t *testing.T, monitor *event.CommandMonitor) *Cl
 		readPreference: readpref.Primary(),
 		clock:          clock,
 		registry:       bson.DefaultRegistry,
+		monitor:        monitor,
 	}
 
 	subscription, err := c.topology.Subscribe()
@@ -361,10 +361,10 @@ func createRetryMonitoredTopology(t *testing.T, clock *session.ClusterClock, mon
 		topology.WithServerOptions(func(opts ...topology.ServerOption) []topology.ServerOption {
 			return append(
 				opts,
-				topology.WithConnectionOptions(func(opts ...connection.Option) []connection.Option {
+				topology.WithConnectionOptions(func(opts ...topology.ConnectionOption) []topology.ConnectionOption {
 					return append(
 						opts,
-						connection.WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
+						topology.WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
 							return monitor
 						}),
 					)
@@ -381,7 +381,7 @@ func createRetryMonitoredTopology(t *testing.T, clock *session.ClusterClock, mon
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = retryMonitoredTopo.Connect(ctx)
+		err = retryMonitoredTopo.Connect()
 		if err != nil {
 			t.Fatal(err)
 		}

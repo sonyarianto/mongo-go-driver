@@ -7,24 +7,22 @@
 package main
 
 import (
-	"context"
 	"log"
 	"time"
 
 	"github.com/kr/pretty"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/topology"
-	"github.com/mongodb/mongo-go-driver/x/network/address"
-	"github.com/mongodb/mongo-go-driver/x/network/connection"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 )
 
 func main() {
 	s, err := topology.ConnectServer(
-		context.Background(),
 		address.Address("localhost:27017"),
+		nil,
 		topology.WithHeartbeatInterval(func(time.Duration) time.Duration { return 2 * time.Second }),
 		topology.WithConnectionOptions(
-			func(opts ...connection.Option) []connection.Option {
-				return append(opts, connection.WithAppName(func(string) string { return "server monitoring test" }))
+			func(opts ...topology.ConnectionOption) []topology.ConnectionOption {
+				return append(opts, topology.WithAppName(func(string) string { return "server monitoring test" }))
 			},
 		),
 	)

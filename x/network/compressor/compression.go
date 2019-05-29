@@ -4,7 +4,7 @@
 // not use this file except in compliance with the License. You may obtain
 // a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 
-package compressor
+package compressor // import "go.mongodb.org/mongo-driver/x/network/compressor"
 
 import (
 	"bytes"
@@ -13,7 +13,7 @@ import (
 	"io"
 
 	"github.com/golang/snappy"
-	"github.com/mongodb/mongo-go-driver/x/network/wiremessage"
+	"go.mongodb.org/mongo-driver/x/network/wiremessage"
 )
 
 // Compressor is the interface implemented by types that can compress and decompress wire messages. This is used
@@ -83,22 +83,23 @@ func (s *SnappyCompressor) Name() string {
 
 // CompressBytes uses zlib to compress a slice of bytes.
 func (z *ZlibCompressor) CompressBytes(src, dest []byte) ([]byte, error) {
-	dest = dest[:0]
-	z.zlibWriter.Reset(&writer{
-		buf: dest,
-	})
+	output := &writer{
+		buf: dest[:0],
+	}
+
+	z.zlibWriter.Reset(output)
 
 	_, err := z.zlibWriter.Write(src)
 	if err != nil {
 		_ = z.zlibWriter.Close()
-		return dest, err
+		return output.buf, err
 	}
 
 	err = z.zlibWriter.Close()
 	if err != nil {
-		return dest, err
+		return output.buf, err
 	}
-	return dest, nil
+	return output.buf, nil
 }
 
 // UncompressBytes uses zlib to uncompress a slice of bytes. It assumes dest is empty and is the exact size that it
@@ -138,20 +139,32 @@ func CreateSnappy() Compressor {
 }
 
 // CreateZlib creates a zlib compressor
-func CreateZlib(level int) (Compressor, error) {
-	if level < 0 {
-		level = wiremessage.DefaultZlibLevel
+func CreateZlib(level *int) (Compressor, error) {
+	var l int
+
+	if level == nil {
+		l = wiremessage.DefaultZlibLevel
+	} else {
+		l = *level
+	}
+
+	if l < zlib.NoCompression {
+		l = wiremessage.DefaultZlibLevel
+	}
+
+	if l > zlib.BestCompression {
+		l = zlib.BestCompression
 	}
 
 	var compressBuf bytes.Buffer
-	zlibWriter, err := zlib.NewWriterLevel(&compressBuf, level)
+	zlibWriter, err := zlib.NewWriterLevel(&compressBuf, l)
 
 	if err != nil {
 		return &ZlibCompressor{}, err
 	}
 
 	return &ZlibCompressor{
-		level:      level,
+		level:      l,
 		zlibWriter: zlibWriter,
 	}, nil
 }

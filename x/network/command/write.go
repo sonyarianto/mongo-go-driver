@@ -12,12 +12,12 @@ import (
 
 	"errors"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/mongo/writeconcern"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/session"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
-	"github.com/mongodb/mongo-go-driver/x/network/wiremessage"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/x/network/wiremessage"
 )
 
 // Write represents a generic write database command.
@@ -151,7 +151,7 @@ func (w *Write) Encode(desc description.SelectedServer) (wiremessage.WireMessage
 		}
 	}
 
-	if w.Session != nil && w.Session.RetryWrite {
+	if w.Session != nil && w.Session.RetryWrite && cmd.IndexOf("txnNumber") == -1 {
 		cmd = append(cmd, bsonx.Elem{"txnNumber", bsonx.Int64(w.Session.TxnNumber)})
 	}
 
@@ -175,12 +175,17 @@ func (w *Write) Decode(desc description.SelectedServer, wm wiremessage.WireMessa
 	}
 
 	if w.err != nil {
-		if _, ok := w.err.(Error); !ok {
+		cerr, ok := w.err.(Error)
+		if !ok {
 			return w
+		}
+		if cerr.HasErrorLabel(TransientTransactionError) {
+			w.Session.ClearPinnedServer()
 		}
 	}
 
 	_ = updateClusterTimes(w.Session, w.Clock, w.result)
+	w.Session.UpdateRecoveryToken(w.result)
 
 	if writeconcern.AckWrite(w.WriteConcern) {
 		// don't update session operation time for unacknowledged write
@@ -216,6 +221,7 @@ func (w *Write) RoundTrip(ctx context.Context, desc description.SelectedServer, 
 			return nil, err
 		}
 		// Connection errors are transient
+		w.Session.ClearPinnedServer()
 		return nil, Error{Message: err.Error(), Labels: []string{TransientTransactionError, NetworkError}}
 	}
 
@@ -232,6 +238,7 @@ func (w *Write) RoundTrip(ctx context.Context, desc description.SelectedServer, 
 			return nil, err
 		}
 		// Connection errors are transient
+		w.Session.ClearPinnedServer()
 		return nil, Error{Message: err.Error(), Labels: []string{TransientTransactionError, NetworkError}}
 	}
 

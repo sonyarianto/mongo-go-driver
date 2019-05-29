@@ -9,10 +9,10 @@ package wiremessage
 import (
 	"errors"
 	"fmt"
-	"strings"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
 )
 
 // Reply represents the OP_REPLY message of the MongoDB wire protocol.
@@ -117,13 +117,59 @@ func (r *Reply) UnmarshalWireMessage(b []byte) error {
 	return nil
 }
 
+// GetMainLegacyDocument constructs and returns a BSON document for this reply.
+func (r *Reply) GetMainLegacyDocument(fullCollectionName string) (bsonx.Doc, error) {
+	if r.ResponseFlags&CursorNotFound > 0 {
+		fmt.Println("cursor not found err")
+		return bsonx.Doc{
+			{"ok", bsonx.Int32(0)},
+		}, nil
+	}
+	if r.ResponseFlags&QueryFailure > 0 {
+		firstDoc := r.Documents[0]
+		return bsonx.Doc{
+			{"ok", bsonx.Int32(0)},
+			{"errmsg", bsonx.String(firstDoc.Lookup("$err").StringValue())},
+			{"code", bsonx.Int32(firstDoc.Lookup("code").Int32())},
+		}, nil
+	}
+
+	doc := bsonx.Doc{
+		{"ok", bsonx.Int32(1)},
+	}
+
+	batchStr := "firstBatch"
+	if r.StartingFrom != 0 {
+		batchStr = "nextBatch"
+	}
+
+	batchArr := make([]bsonx.Val, len(r.Documents))
+	for i, docRaw := range r.Documents {
+		doc, err := bsonx.ReadDoc(docRaw)
+		if err != nil {
+			return nil, err
+		}
+
+		batchArr[i] = bsonx.Document(doc)
+	}
+
+	cursorDoc := bsonx.Doc{
+		{"id", bsonx.Int64(r.CursorID)},
+		{"ns", bsonx.String(fullCollectionName)},
+		{batchStr, bsonx.Array(batchArr)},
+	}
+
+	doc = doc.Append("cursor", bsonx.Document(cursorDoc))
+	return doc, nil
+}
+
 // GetMainDocument returns the main BSON document for this reply.
 func (r *Reply) GetMainDocument() (bsonx.Doc, error) {
 	return bsonx.ReadDoc([]byte(r.Documents[0]))
 }
 
 // ReplyFlag represents the flags of an OP_REPLY message.
-type ReplyFlag int32
+type ReplyFlag = wiremessage.ReplyFlag
 
 // These constants represent the individual flags of an OP_REPLY message.
 const (
@@ -132,24 +178,3 @@ const (
 	ShardConfigStale
 	AwaitCapable
 )
-
-// String implements the fmt.Stringer interface.
-func (rf ReplyFlag) String() string {
-	strs := make([]string, 0)
-	if rf&CursorNotFound == CursorNotFound {
-		strs = append(strs, "CursorNotFound")
-	}
-	if rf&QueryFailure == QueryFailure {
-		strs = append(strs, "QueryFailure")
-	}
-	if rf&ShardConfigStale == ShardConfigStale {
-		strs = append(strs, "ShardConfigStale")
-	}
-	if rf&AwaitCapable == AwaitCapable {
-		strs = append(strs, "AwaitCapable")
-	}
-	str := "["
-	str += strings.Join(strs, ", ")
-	str += "]"
-	return str
-}

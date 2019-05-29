@@ -6,13 +6,19 @@ UNSTABLE_PKGS = $(shell etc/list_pkgs.sh ./x)
 UNSTABLE_TEST_PKGS = $(shell etc/list_test_pkgs.sh ./x)
 TAG_PKG = $(shell etc/list_pkgs.sh ./tag)
 TAG_TEST_PKG = $(shell etc/list_test_pkgs.sh ./tag)
-PKGS = $(BSON_PKGS) $(MONGO_PKGS) $(UNSTABLE_PKGS) $(TAG_PKG)
-TEST_PKGS = $(BSON_TEST_PKGS) $(MONGO_TEST_PKGS) $(UNSTABLE_TEST_PKGS) $(TAG_PKG)
+EXAMPLES_PKGS = $(shell etc/list_pkgs.sh ./examples)
+EXAMPLES_TEST_PKGS = $(shell etc/list_test_pkgs.sh ./examples)
+PKGS = $(BSON_PKGS) $(MONGO_PKGS) $(UNSTABLE_PKGS) $(TAG_PKG) $(EXAMPLES_PKGS)
+TEST_PKGS = $(BSON_TEST_PKGS) $(MONGO_TEST_PKGS) $(UNSTABLE_TEST_PKGS) $(TAG_PKG) $(EXAMPLES_TEST_PKGS)
 
 TEST_TIMEOUT = 600
 
 .PHONY: default
-default: check-fmt vet build-examples lint errcheck test-cover test-race
+default: check-env check-fmt vet build-examples lint errcheck test-cover test-race
+
+.PHONY: check-env
+check-env:
+	etc/check_env.sh
 
 .PHONY: doc
 doc:
@@ -97,7 +103,7 @@ update-notices:
 
 .PHONY: vet
 vet:
-	go vet -cgocall=false -composites=false -structtags=false -unusedstringmethods="Error" $(PKGS)
+	go vet -cgocall=false -composites=false -unusedstringmethods="Error" $(PKGS)
 
 
 # Evergreen specific targets

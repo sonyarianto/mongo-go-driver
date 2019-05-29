@@ -5,14 +5,15 @@
 // a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
 
 // Package result contains the results from various operations.
-package result
+package result // import "go.mongodb.org/mongo-driver/x/network/result"
 
 import (
+	"fmt"
 	"time"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/bson/objectid"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/x/bsonx"
 )
 
 // Upsert contains the information for a single upsert.
@@ -64,6 +65,7 @@ type FindAndModify struct {
 		UpdatedExisting bool
 		Upserted        interface{}
 	}
+	WriteConcernError *WriteConcernError `bson:"writeConcernError"`
 }
 
 // WriteError is an error from a write operation that is not a write concern
@@ -76,9 +78,17 @@ type WriteError struct {
 
 // WriteConcernError is an error related to a write concern.
 type WriteConcernError struct {
+	Name    string `bson:"codeName"`
 	Code    int
 	ErrMsg  string
 	ErrInfo bson.Raw
+}
+
+func (wce WriteConcernError) Error() string {
+	if wce.Name != "" {
+		return fmt.Sprintf("(%v) %v", wce.Name, wce.ErrMsg)
+	}
+	return wce.ErrMsg
 }
 
 // ListDatabases is the result from a listDatabases command.
@@ -93,32 +103,32 @@ type ListDatabases struct {
 
 // IsMaster is a result of an IsMaster command.
 type IsMaster struct {
-	Arbiters                     []string          `bson:"arbiters,omitempty"`
-	ArbiterOnly                  bool              `bson:"arbiterOnly,omitempty"`
-	ClusterTime                  bsonx.Doc         `bson:"$clusterTime,omitempty"`
-	Compression                  []string          `bson:"compression,omitempty"`
-	ElectionID                   objectid.ObjectID `bson:"electionId,omitempty"`
-	Hidden                       bool              `bson:"hidden,omitempty"`
-	Hosts                        []string          `bson:"hosts,omitempty"`
-	IsMaster                     bool              `bson:"ismaster,omitempty"`
-	IsReplicaSet                 bool              `bson:"isreplicaset,omitempty"`
-	LastWriteTimestamp           time.Time         `bson:"lastWriteDate,omitempty"`
-	LogicalSessionTimeoutMinutes uint32            `bson:"logicalSessionTimeoutMinutes,omitempty"`
-	MaxBSONObjectSize            uint32            `bson:"maxBsonObjectSize,omitempty"`
-	MaxMessageSizeBytes          uint32            `bson:"maxMessageSizeBytes,omitempty"`
-	MaxWriteBatchSize            uint32            `bson:"maxWriteBatchSize,omitempty"`
-	Me                           string            `bson:"me,omitempty"`
-	MaxWireVersion               int32             `bson:"maxWireVersion,omitempty"`
-	MinWireVersion               int32             `bson:"minWireVersion,omitempty"`
-	Msg                          string            `bson:"msg,omitempty"`
-	OK                           int32             `bson:"ok"`
-	Passives                     []string          `bson:"passives,omitempty"`
-	ReadOnly                     bool              `bson:"readOnly,omitempty"`
-	SaslSupportedMechs           []string          `bson:"saslSupportedMechs,omitempty"`
-	Secondary                    bool              `bson:"secondary,omitempty"`
-	SetName                      string            `bson:"setName,omitempty"`
-	SetVersion                   uint32            `bson:"setVersion,omitempty"`
-	Tags                         map[string]string `bson:"tags,omitempty"`
+	Arbiters                     []string           `bson:"arbiters,omitempty"`
+	ArbiterOnly                  bool               `bson:"arbiterOnly,omitempty"`
+	ClusterTime                  bson.Raw           `bson:"$clusterTime,omitempty"`
+	Compression                  []string           `bson:"compression,omitempty"`
+	ElectionID                   primitive.ObjectID `bson:"electionId,omitempty"`
+	Hidden                       bool               `bson:"hidden,omitempty"`
+	Hosts                        []string           `bson:"hosts,omitempty"`
+	IsMaster                     bool               `bson:"ismaster,omitempty"`
+	IsReplicaSet                 bool               `bson:"isreplicaset,omitempty"`
+	LastWriteTimestamp           time.Time          `bson:"lastWriteDate,omitempty"`
+	LogicalSessionTimeoutMinutes uint32             `bson:"logicalSessionTimeoutMinutes,omitempty"`
+	MaxBSONObjectSize            uint32             `bson:"maxBsonObjectSize,omitempty"`
+	MaxMessageSizeBytes          uint32             `bson:"maxMessageSizeBytes,omitempty"`
+	MaxWriteBatchSize            uint32             `bson:"maxWriteBatchSize,omitempty"`
+	Me                           string             `bson:"me,omitempty"`
+	MaxWireVersion               int32              `bson:"maxWireVersion,omitempty"`
+	MinWireVersion               int32              `bson:"minWireVersion,omitempty"`
+	Msg                          string             `bson:"msg,omitempty"`
+	OK                           int32              `bson:"ok"`
+	Passives                     []string           `bson:"passives,omitempty"`
+	ReadOnly                     bool               `bson:"readOnly,omitempty"`
+	SaslSupportedMechs           []string           `bson:"saslSupportedMechs,omitempty"`
+	Secondary                    bool               `bson:"secondary,omitempty"`
+	SetName                      string             `bson:"setName,omitempty"`
+	SetVersion                   uint32             `bson:"setVersion,omitempty"`
+	Tags                         map[string]string  `bson:"tags,omitempty"`
 }
 
 // BuildInfo is a result of a BuildInfo command.

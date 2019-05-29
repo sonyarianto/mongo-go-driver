@@ -13,12 +13,12 @@ import (
 	"context"
 	"os"
 
-	"github.com/mongodb/mongo-go-driver/internal/testutil"
-	"github.com/mongodb/mongo-go-driver/mongo/writeconcern"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/topology"
-	"github.com/mongodb/mongo-go-driver/x/network/connstring"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
+	"go.mongodb.org/mongo-driver/internal/testutil"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 )
 
 type scramTestCase struct {
@@ -33,7 +33,7 @@ func TestSCRAM(t *testing.T) {
 		t.Skip("Skipping because authentication is required")
 	}
 
-	server, err := testutil.Topology(t).SelectServer(context.Background(), description.WriteSelector())
+	server, err := testutil.Topology(t).SelectServerLegacy(context.Background(), description.WriteSelector())
 	noerr(t, err)
 
 	if !server.Description().WireVersion.Includes(7) {
@@ -137,7 +137,7 @@ func testScramUserAuthWithMech(t *testing.T, c scramTestCase, mech string) error
 func runScramAuthTest(t *testing.T, cs connstring.ConnString) error {
 	t.Helper()
 	topology := testutil.TopologyWithConnString(t, cs)
-	ss, err := topology.SelectServer(context.Background(), description.WriteSelector())
+	ss, err := topology.SelectServerLegacy(context.Background(), description.WriteSelector())
 	noerr(t, err)
 
 	cmd := bsonx.Doc{{"dbstats", bsonx.Int32(1)}}

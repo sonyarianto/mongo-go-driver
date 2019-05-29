@@ -13,21 +13,21 @@ import (
 	"bytes"
 	"errors"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/internal"
-	"github.com/mongodb/mongo-go-driver/internal/testutil"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/topology"
-	"github.com/mongodb/mongo-go-driver/x/network/command"
-	"github.com/mongodb/mongo-go-driver/x/network/connection"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
-	"github.com/mongodb/mongo-go-driver/x/network/wiremessage"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/internal"
+	"go.mongodb.org/mongo-driver/internal/testutil"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/x/network/command"
+	"go.mongodb.org/mongo-driver/x/network/connection"
+	"go.mongodb.org/mongo-driver/x/network/wiremessage"
 )
 
 func createServerConn(t *testing.T) (*topology.SelectedServer, connection.Connection) {
-	server, err := testutil.Topology(t).SelectServer(context.Background(), description.WriteSelector())
+	server, err := testutil.Topology(t).SelectServerLegacy(context.Background(), description.WriteSelector())
 	noerr(t, err)
-	conn, err := server.Connection(context.Background())
+	conn, err := server.ConnectionLegacy(context.Background())
 	noerr(t, err)
 
 	return server, conn

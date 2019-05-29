@@ -1,3 +1,11 @@
+runOn:
+    -
+        minServerVersion: "4.0"
+        topology: ["replicaset"]
+    -
+        minServerVersion: "4.1.8"
+        topology: ["sharded"]
+
 database_name: &database_name "transaction-tests"
 collection_name: &collection_name "test"
 
@@ -17,7 +25,9 @@ tests:
             - _id: 1
             - _id: 1
         result:
-          errorCodeName: DuplicateKey
+          # Don't assert on errorCodeName because (after SERVER-38583) the
+          # DuplicateKey is reported in writeErrors, not as a top-level
+          # command error.
           errorLabelsOmit: ["TransientTransactionError", "UnknownTransactionCommitResult"]
       - name: abortTransaction
         object: session0
@@ -361,6 +371,7 @@ tests:
             pipeline:
               - $project:
                   _id: 1
+            cursor: {}
             readConcern:
             lsid: session0
             txnNumber:
@@ -460,7 +471,8 @@ tests:
               $numberLong: "1"
             startTransaction:
             autocommit: false
-            writeConcern:
+            # commitTransaction applies w:majority on retries
+            writeConcern: { w: majority, wtimeout: 10000 }
           command_name: commitTransaction
           database_name: admin
       - command_started_event:
@@ -471,7 +483,7 @@ tests:
               $numberLong: "1"
             startTransaction:
             autocommit: false
-            writeConcern:
+            writeConcern: { w: majority, wtimeout: 10000 }
           command_name: commitTransaction
           database_name: admin
 
@@ -487,7 +499,7 @@ tests:
       mode: { times: 2 }
       data:
           failCommands: ["commitTransaction"]
-          errorCode: 11602  # InterruptedDueToReplStateChange
+          errorCode: 11602  # InterruptedDueToStepDown
 
     operations:
       - name: startTransaction
@@ -543,7 +555,8 @@ tests:
               $numberLong: "1"
             startTransaction:
             autocommit: false
-            writeConcern:
+            # commitTransaction applies w:majority on retries
+            writeConcern: { w: majority, wtimeout: 10000 }
           command_name: commitTransaction
           database_name: admin
       - command_started_event:
@@ -554,7 +567,7 @@ tests:
               $numberLong: "1"
             startTransaction:
             autocommit: false
-            writeConcern:
+            writeConcern: { w: majority, wtimeout: 10000 }
           command_name: commitTransaction
           database_name: admin
 
@@ -633,8 +646,8 @@ tests:
               $numberLong: "1"
             startTransaction:
             autocommit: false
-            writeConcern:
-              w: majority
+            # commitTransaction applies w:majority on retries
+            writeConcern: { w: majority, wtimeout: 10000 }
           command_name: commitTransaction
           database_name: admin
       - command_started_event:
@@ -645,8 +658,8 @@ tests:
               $numberLong: "1"
             startTransaction:
             autocommit: false
-            writeConcern:
-              w: majority
+            # commitTransaction applies w:majority on retries
+            writeConcern: { w: majority, wtimeout: 10000 }
           command_name: commitTransaction
           database_name: admin
 
@@ -725,8 +738,8 @@ tests:
               $numberLong: "1"
             startTransaction:
             autocommit: false
-            writeConcern:
-              w: majority
+            # commitTransaction applies w:majority on retries
+            writeConcern: { w: majority, wtimeout: 10000 }
           command_name: commitTransaction
           database_name: admin
 
@@ -807,8 +820,8 @@ tests:
               $numberLong: "1"
             startTransaction:
             autocommit: false
-            writeConcern:
-              w: majority
+            # commitTransaction applies w:majority on retries
+            writeConcern: { w: majority, wtimeout: 10000 }
           command_name: commitTransaction
           database_name: admin
 
@@ -825,7 +838,7 @@ tests:
       data:
           failCommands: ["commitTransaction"]
           writeConcernError:
-            code: 100  # UnsatisfiableWriteConcern/CannotSatisfyWriteConcern
+            code: 100  # UnsatisfiableWriteConcern
             errmsg: Not enough data-bearing nodes
 
     operations:

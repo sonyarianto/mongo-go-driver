@@ -8,20 +8,24 @@
 // of servers. This package is designed to expose enough inner workings of service discovery
 // and monitoring to allow low level applications to have fine grained control, while hiding
 // most of the detailed implementation of the algorithms.
-package topology
+package topology // import "go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 
 import (
 	"context"
 	"errors"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/mongodb/mongo-go-driver/bson/bsoncodec"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/session"
-	"github.com/mongodb/mongo-go-driver/x/network/address"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
+	"fmt"
+
+	"go.mongodb.org/mongo-driver/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/dns"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
 )
 
 // ErrSubscribeAfterClosed is returned when a user attempts to subscribe to a
@@ -51,19 +55,22 @@ const (
 
 // Topology represents a MongoDB deployment.
 type Topology struct {
-	registry *bsoncodec.Registry
-
 	connectionstate int32
 
 	cfg *config
 
 	desc atomic.Value // holds a description.Topology
 
+	dnsResolver *dns.Resolver
+
 	done chan struct{}
 
-	fsm       *fsm
-	changes   chan description.Server
-	changeswg sync.WaitGroup
+	pollingDone       chan struct{}
+	pollingwg         sync.WaitGroup
+	rescanSRVInterval time.Duration
+	pollHeartbeatTime atomic.Value // holds a bool
+
+	fsm *fsm
 
 	SessionPool *session.Pool
 
@@ -82,8 +89,6 @@ type Topology struct {
 	serversLock   sync.Mutex
 	serversClosed bool
 	servers       map[address.Address]*Server
-
-	wg sync.WaitGroup
 }
 
 // New creates a new topology.
@@ -94,12 +99,14 @@ func New(opts ...Option) (*Topology, error) {
 	}
 
 	t := &Topology{
-		cfg:         cfg,
-		done:        make(chan struct{}),
-		fsm:         newFSM(),
-		changes:     make(chan description.Server),
-		subscribers: make(map[uint64]chan description.Topology),
-		servers:     make(map[address.Address]*Server),
+		cfg:               cfg,
+		done:              make(chan struct{}),
+		pollingDone:       make(chan struct{}),
+		rescanSRVInterval: 60 * time.Second,
+		fsm:               newFSM(),
+		subscribers:       make(map[uint64]chan description.Topology),
+		servers:           make(map[address.Address]*Server),
+		dnsResolver:       dns.DefaultResolver,
 	}
 	t.desc.Store(description.Topology{})
 
@@ -117,7 +124,7 @@ func New(opts ...Option) (*Topology, error) {
 
 // Connect initializes a Topology and starts the monitoring process. This function
 // must be called to properly monitor the topology.
-func (t *Topology) Connect(ctx context.Context) error {
+func (t *Topology) Connect() error {
 	if !atomic.CompareAndSwapInt32(&t.connectionstate, disconnected, connecting) {
 		return ErrTopologyConnected
 	}
@@ -128,12 +135,14 @@ func (t *Topology) Connect(ctx context.Context) error {
 	for _, a := range t.cfg.seedList {
 		addr := address.Address(a).Canonicalize()
 		t.fsm.Servers = append(t.fsm.Servers, description.Server{Addr: addr})
-		err = t.addServer(ctx, addr)
+		err = t.addServer(addr)
 	}
 	t.serversLock.Unlock()
 
-	go t.update()
-	t.changeswg.Add(1)
+	if srvPollingRequired(t.cfg.cs.Original) {
+		go t.pollSRVRecords()
+		t.pollingwg.Add(1)
+	}
 
 	t.subscriptionsClosed = false // explicitly set in case topology was disconnected and then reconnected
 
@@ -152,21 +161,39 @@ func (t *Topology) Disconnect(ctx context.Context) error {
 		return ErrTopologyClosed
 	}
 
+	servers := make(map[address.Address]*Server)
 	t.serversLock.Lock()
 	t.serversClosed = true
 	for addr, server := range t.servers {
-		t.removeServer(ctx, addr, server)
+		servers[addr] = server
 	}
 	t.serversLock.Unlock()
 
-	t.wg.Wait()
-	t.done <- struct{}{}
-	t.changeswg.Wait()
+	for _, server := range servers {
+		_ = server.Disconnect(ctx)
+	}
+
+	t.subLock.Lock()
+	for id, ch := range t.subscribers {
+		close(ch)
+		delete(t.subscribers, id)
+	}
+	t.subscriptionsClosed = true
+	t.subLock.Unlock()
+
+	if srvPollingRequired(t.cfg.cs.Original) {
+		t.pollingDone <- struct{}{}
+		t.pollingwg.Wait()
+	}
 
 	t.desc.Store(description.Topology{})
 
 	atomic.StoreInt32(&t.connectionstate, disconnected)
 	return nil
+}
+
+func srvPollingRequired(connstr string) bool {
+	return strings.HasPrefix(connstr, "mongodb+srv://")
 }
 
 // Description returns a description of the topology.
@@ -177,6 +204,9 @@ func (t *Topology) Description() description.Topology {
 	}
 	return td
 }
+
+// Kind returns the topology kind of this Topology.
+func (t *Topology) Kind() description.TopologyKind { return t.Description().Kind }
 
 // Subscribe returns a Subscription on which all updated description.Topologys
 // will be sent. The channel of the subscription will have a buffer size of one,
@@ -226,10 +256,56 @@ func (t *Topology) SupportsSessions() bool {
 	return t.Description().SessionTimeoutMinutes != 0 && t.Description().Kind != description.Single
 }
 
-// SelectServer selects a server given a selector.SelectServer complies with the
+// SupportsRetry returns true if the topology supports retryability, which it does if it supports sessions.
+func (t *Topology) SupportsRetry() bool { return t.SupportsSessions() }
+
+// SelectServer selects a server with given a selector. SelectServer complies with the
 // server selection spec, and will time out after severSelectionTimeout or when the
 // parent context is done.
-func (t *Topology) SelectServer(ctx context.Context, ss description.ServerSelector) (*SelectedServer, error) {
+func (t *Topology) SelectServer(ctx context.Context, ss description.ServerSelector) (driver.Server, error) {
+	if atomic.LoadInt32(&t.connectionstate) != connected {
+		return nil, ErrTopologyClosed
+	}
+	var ssTimeoutCh <-chan time.Time
+
+	if t.cfg.serverSelectionTimeout > 0 {
+		ssTimeout := time.NewTimer(t.cfg.serverSelectionTimeout)
+		ssTimeoutCh = ssTimeout.C
+		defer ssTimeout.Stop()
+	}
+
+	sub, err := t.Subscribe()
+	if err != nil {
+		return nil, err
+	}
+	defer sub.Unsubscribe()
+
+	for {
+		suitable, err := t.selectServer(ctx, sub.C, ss, ssTimeoutCh)
+		if err != nil {
+			return nil, err
+		}
+
+		selected := suitable[rand.Intn(len(suitable))]
+		selectedS, err := t.FindServer(selected)
+		switch {
+		case err != nil:
+			return nil, err
+		case selectedS != nil:
+			return selectedS, nil
+		default:
+			// We don't have an actual server for the provided description.
+			// This could happen for a number of reasons, including that the
+			// server has since stopped being a part of this topology, or that
+			// the server selector returned no suitable servers.
+		}
+	}
+}
+
+// SelectServerLegacy selects a server with given a selector. SelectServerLegacy complies with the
+// server selection spec, and will time out after severSelectionTimeout or when the
+// parent context is done.
+func (t *Topology) SelectServerLegacy(ctx context.Context, ss description.ServerSelector) (*SelectedServer, error) {
 	if atomic.LoadInt32(&t.connectionstate) != connected {
 		return nil, ErrTopologyClosed
 	}
@@ -289,6 +365,10 @@ func (t *Topology) FindServer(selected description.Server) (*SelectedServer, err
 	}, nil
 }
 
+func wrapServerSelectionError(err error, t *Topology) error {
+	return fmt.Errorf("server selection error: %v\ncurrent topology: %s", err, t.String())
+}
+
 // selectServer is the core piece of server selection. It handles getting
 // topology descriptions and running sever selection on those descriptions.
 func (t *Topology) selectServer(ctx context.Context, subscriptionCh <-chan description.Topology, ss description.ServerSelector, timeoutCh <-chan time.Time) ([]description.Server, error) {
@@ -298,7 +378,7 @@ func (t *Topology) selectServer(ctx context.Context, subscriptionCh <-chan descr
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-timeoutCh:
-			return nil, ErrServerSelectionTimeout
+			return nil, wrapServerSelectionError(ErrServerSelectionTimeout, t)
 		case current = <-subscriptionCh:
 		}
 
@@ -311,7 +391,7 @@ func (t *Topology) selectServer(ctx context.Context, subscriptionCh <-chan descr
 
 		suitable, err := ss.SelectServer(current, allowed)
 		if err != nil {
-			return nil, err
+			return nil, wrapServerSelectionError(err, t)
 		}
 
 		if len(suitable) > 0 {
@@ -322,108 +402,197 @@ func (t *Topology) selectServer(ctx context.Context, subscriptionCh <-chan descr
 	}
 }
 
-func (t *Topology) update() {
-	defer t.changeswg.Done()
+func (t *Topology) pollSRVRecords() {
+	defer t.pollingwg.Done()
+
+	serverConfig, _ := newServerConfig(t.cfg.serverOpts...)
+	heartbeatInterval := serverConfig.heartbeatInterval
+
+	pollTicker := time.NewTicker(t.rescanSRVInterval)
+	defer pollTicker.Stop()
+	t.pollHeartbeatTime.Store(false)
+	var doneOnce bool
 	defer func() {
 		//  ¯\_(ツ)_/¯
-		if r := recover(); r != nil {
-			<-t.done
+		if r := recover(); r != nil && !doneOnce {
+			<-t.pollingDone
 		}
 	}()
 
+	// remove the scheme
+	uri := t.cfg.cs.Original[14:]
+	hosts := uri
+	if idx := strings.IndexAny(uri, "/?@"); idx != -1 {
+		hosts = uri[:idx]
+	}
+
 	for {
 		select {
-		case change := <-t.changes:
-			current, err := t.apply(context.TODO(), change)
-			if err != nil {
-				continue
-			}
-
-			t.desc.Store(current)
-			t.subLock.Lock()
-			for _, ch := range t.subscribers {
-				// We drain the description if there's one in the channel
-				select {
-				case <-ch:
-				default:
-				}
-				ch <- current
-			}
-			t.subLock.Unlock()
-		case <-t.done:
-			t.subLock.Lock()
-			for id, ch := range t.subscribers {
-				close(ch)
-				delete(t.subscribers, id)
-			}
-			t.subscriptionsClosed = true
-			t.subLock.Unlock()
+		case <-pollTicker.C:
+		case <-t.pollingDone:
+			doneOnce = true
 			return
 		}
+		topoKind := t.Description().Kind
+		if !(topoKind == description.Unknown || topoKind == description.Sharded) {
+			break
+		}
+
+		parsedHosts, err := t.dnsResolver.ParseHosts(hosts, false)
+		// DNS problem or no verified hosts returned
+		if err != nil || len(parsedHosts) == 0 {
+			if !t.pollHeartbeatTime.Load().(bool) {
+				pollTicker.Stop()
+				pollTicker = time.NewTicker(heartbeatInterval)
+				t.pollHeartbeatTime.Store(true)
+			}
+			continue
+		}
+		if t.pollHeartbeatTime.Load().(bool) {
+			pollTicker.Stop()
+			pollTicker = time.NewTicker(t.rescanSRVInterval)
+			t.pollHeartbeatTime.Store(false)
+		}
+
+		cont := t.processSRVResults(parsedHosts)
+		if !cont {
+			break
+		}
 	}
+	<-t.pollingDone
+	doneOnce = true
 }
 
-func (t *Topology) apply(ctx context.Context, desc description.Server) (description.Topology, error) {
+func (t *Topology) processSRVResults(parsedHosts []string) bool {
+	t.serversLock.Lock()
+	defer t.serversLock.Unlock()
+
+	if t.serversClosed {
+		return false
+	}
+	diff := t.fsm.Topology.DiffHostlist(parsedHosts)
+
+	if len(diff.Added) == 0 && len(diff.Removed) == 0 {
+		return true
+	}
+
+	for _, r := range diff.Removed {
+		addr := address.Address(r).Canonicalize()
+		s, ok := t.servers[addr]
+		if !ok {
+			continue
+		}
+		go func() {
+			cancelCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_ = s.Disconnect(cancelCtx)
+		}()
+		delete(t.servers, addr)
+		t.fsm.removeServerByAddr(addr)
+	}
+	for _, a := range diff.Added {
+		addr := address.Address(a).Canonicalize()
+		_ = t.addServer(addr)
+		t.fsm.addServer(addr)
+	}
+	//store new description
+	newDesc := description.Topology{
+		Kind:                  t.fsm.Kind,
+		Servers:               t.fsm.Servers,
+		SessionTimeoutMinutes: t.fsm.SessionTimeoutMinutes,
+	}
+	t.desc.Store(newDesc)
+
+	t.subLock.Lock()
+	for _, ch := range t.subscribers {
+		// We drain the description if there's one in the channel
+		select {
+		case <-ch:
+		default:
+		}
+		ch <- newDesc
+	}
+	t.subLock.Unlock()
+
+	return true
+
+}
+
+func (t *Topology) apply(ctx context.Context, desc description.Server) {
 	var err error
+
+	t.serversLock.Lock()
+	defer t.serversLock.Unlock()
+
+	if _, ok := t.servers[desc.Addr]; t.serversClosed || !ok {
+		return
+	}
+
 	prev := t.fsm.Topology
 
 	current, err := t.fsm.apply(desc)
 	if err != nil {
-		return description.Topology{}, err
+		return
 	}
 
 	diff := description.DiffTopology(prev, current)
-	t.serversLock.Lock()
-	if t.serversClosed {
-		t.serversLock.Unlock()
-		return description.Topology{}, nil
-	}
 
 	for _, removed := range diff.Removed {
 		if s, ok := t.servers[removed.Addr]; ok {
-			t.removeServer(ctx, removed.Addr, s)
+			go func() {
+				cancelCtx, cancel := context.WithCancel(ctx)
+				cancel()
+				_ = s.Disconnect(cancelCtx)
+			}()
+			delete(t.servers, removed.Addr)
 		}
 	}
 
 	for _, added := range diff.Added {
-		_ = t.addServer(ctx, added.Addr)
+		_ = t.addServer(added.Addr)
 	}
-	t.serversLock.Unlock()
-	return current, nil
+
+	t.desc.Store(current)
+
+	t.subLock.Lock()
+	for _, ch := range t.subscribers {
+		// We drain the description if there's one in the channel
+		select {
+		case <-ch:
+		default:
+		}
+		ch <- current
+	}
+	t.subLock.Unlock()
+
 }
 
-func (t *Topology) addServer(ctx context.Context, addr address.Address) error {
+func (t *Topology) addServer(addr address.Address) error {
 	if _, ok := t.servers[addr]; ok {
 		return nil
 	}
 
-	svr, err := ConnectServer(ctx, addr, t.cfg.serverOpts...)
+	topoFunc := func(desc description.Server) {
+		t.apply(context.TODO(), desc)
+	}
+	svr, err := ConnectServer(addr, topoFunc, t.cfg.serverOpts...)
 	if err != nil {
 		return err
 	}
 
 	t.servers[addr] = svr
-	var sub *ServerSubscription
-	sub, err = svr.Subscribe()
-	if err != nil {
-		return err
-	}
-
-	t.wg.Add(1)
-	go func() {
-		for c := range sub.C {
-			t.changes <- c
-		}
-
-		t.wg.Done()
-	}()
 
 	return nil
 }
 
-func (t *Topology) removeServer(ctx context.Context, addr address.Address, server *Server) {
-	_ = server.Disconnect(ctx)
-	delete(t.servers, addr)
+// String implements the Stringer interface
+func (t *Topology) String() string {
+	desc := t.Description()
+	str := fmt.Sprintf("Type: %s\nServers:\n", desc.Kind)
+	for _, s := range t.servers {
+		str += s.String() + "\n"
+	}
+	return str
 }
 
 // Subscription is a subscription to updates to the description of the Topology that created this

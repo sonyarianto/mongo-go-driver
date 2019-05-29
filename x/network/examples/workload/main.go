@@ -17,18 +17,18 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/mongodb/mongo-go-driver/mongo/options"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/x/bsonx"
 
-	"github.com/mongodb/mongo-go-driver/bson"
+	"go.mongodb.org/mongo-driver/bson"
 
-	"github.com/mongodb/mongo-go-driver/mongo/readpref"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/session"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/topology"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/uuid"
-	"github.com/mongodb/mongo-go-driver/x/network/command"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/uuid"
+	"go.mongodb.org/mongo-driver/x/mongo/driverlegacy"
+	"go.mongodb.org/mongo-driver/x/network/command"
 )
 
 var concurrency = flag.Int("concurrency", 24, "how much concurrency should be used")
@@ -84,12 +84,12 @@ func prep(ctx context.Context, c *topology.Topology) error {
 
 	ns := command.ParseNamespace(*ns)
 
-	s, err := c.SelectServer(ctx, description.WriteSelector())
+	s, err := c.SelectServerLegacy(ctx, description.WriteSelector())
 	if err != nil {
 		return err
 	}
 
-	conn, err := s.Connection(ctx)
+	conn, err := s.ConnectionLegacy(ctx)
 	if err != nil {
 		return err
 	}
@@ -136,7 +136,7 @@ func work(ctx context.Context, idx int, c *topology.Topology) {
 				Pipeline: pipeline,
 				ReadPref: rp,
 			}
-			cursor, err := driver.Aggregate(
+			cursor, err := driverlegacy.Aggregate(
 				ctx, cmd, c,
 				description.ReadPrefSelector(rp),
 				description.ReadPrefSelector(rp),

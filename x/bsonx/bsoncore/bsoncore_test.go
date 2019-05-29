@@ -14,9 +14,8 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
-	"github.com/mongodb/mongo-go-driver/bson/bsontype"
-	"github.com/mongodb/mongo-go-driver/bson/decimal"
-	"github.com/mongodb/mongo-go-driver/bson/objectid"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func noerr(t *testing.T, err error) {
@@ -71,6 +70,12 @@ func TestAppend(t *testing.T) {
 			AppendHeader,
 			[]interface{}{make([]byte, 0), bsontype.Null, "foobar"},
 			[]byte{byte(bsontype.Null), 'f', 'o', 'o', 'b', 'a', 'r', 0x00},
+		},
+		{
+			"AppendValueElement",
+			AppendValueElement,
+			[]interface{}{make([]byte, 0), "testing", Value{Type: bsontype.Boolean, Data: []byte{0x01}}},
+			[]byte{byte(bsontype.Boolean), 't', 'e', 's', 't', 'i', 'n', 'g', 0x00, 0x01},
 		},
 		{
 			"AppendDouble",
@@ -130,6 +135,29 @@ func TestAppend(t *testing.T) {
 			},
 		},
 		{
+			"BuildArray",
+			BuildArray,
+			[]interface{}{make([]byte, 0), Value{Type: bsontype.Double, Data: AppendDouble(nil, 3.14159)}},
+			[]byte{
+				0x10, 0x00, 0x00, 0x00,
+				byte(bsontype.Double), '0', 0x00,
+				pi[0], pi[1], pi[2], pi[3], pi[4], pi[5], pi[6], pi[7],
+				0x00,
+			},
+		},
+		{
+			"BuildArrayElement",
+			BuildArrayElement,
+			[]interface{}{make([]byte, 0), "foobar", Value{Type: bsontype.Double, Data: AppendDouble(nil, 3.14159)}},
+			[]byte{byte(bsontype.Array),
+				'f', 'o', 'o', 'b', 'a', 'r', 0x00,
+				0x10, 0x00, 0x00, 0x00,
+				byte(bsontype.Double), '0', 0x00,
+				pi[0], pi[1], pi[2], pi[3], pi[4], pi[5], pi[6], pi[7],
+				0x00,
+			},
+		},
+		{
 			"AppendBinary Subtype2",
 			AppendBinary,
 			[]interface{}{make([]byte, 0), byte(0x02), []byte{0x01, 0x02, 0x03}},
@@ -174,7 +202,7 @@ func TestAppend(t *testing.T) {
 			AppendObjectID,
 			[]interface{}{
 				make([]byte, 0),
-				objectid.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
+				primitive.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
 			},
 			[]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
 		},
@@ -183,7 +211,7 @@ func TestAppend(t *testing.T) {
 			AppendObjectIDElement,
 			[]interface{}{
 				make([]byte, 0), "foobar",
-				objectid.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
+				primitive.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
 			},
 			[]byte{byte(bsontype.ObjectID),
 				'f', 'o', 'o', 'b', 'a', 'r', 0x00,
@@ -247,7 +275,7 @@ func TestAppend(t *testing.T) {
 			[]interface{}{
 				make([]byte, 0),
 				"foobar",
-				objectid.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
+				primitive.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
 			},
 			[]byte{
 				0x07, 0x00, 0x00, 0x00, 'f', 'o', 'o', 'b', 'a', 'r', 0x00,
@@ -260,7 +288,7 @@ func TestAppend(t *testing.T) {
 			[]interface{}{
 				make([]byte, 0), "foobar",
 				"barbaz",
-				objectid.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
+				primitive.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
 			},
 			[]byte{byte(bsontype.DBPointer),
 				'f', 'o', 'o', 'b', 'a', 'r', 0x00,
@@ -358,7 +386,7 @@ func TestAppend(t *testing.T) {
 		{
 			"AppendDecimal128",
 			AppendDecimal128,
-			[]interface{}{make([]byte, 0), decimal.NewDecimal128(4294967296, 65536)},
+			[]interface{}{make([]byte, 0), primitive.NewDecimal128(4294967296, 65536)},
 			[]byte{
 				0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
 				0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
@@ -367,7 +395,7 @@ func TestAppend(t *testing.T) {
 		{
 			"AppendDecimal128Element",
 			AppendDecimal128Element,
-			[]interface{}{make([]byte, 0), "foobar", decimal.NewDecimal128(4294967296, 65536)},
+			[]interface{}{make([]byte, 0), "foobar", primitive.NewDecimal128(4294967296, 65536)},
 			[]byte{
 				byte(bsontype.Decimal128), 'f', 'o', 'o', 'b', 'a', 'r', 0x00,
 				0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -582,14 +610,14 @@ func TestRead(t *testing.T) {
 			"ReadObjectID/not enough bytes",
 			ReadObjectID,
 			[]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06},
-			[]interface{}{objectid.ObjectID{}, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}, false},
+			[]interface{}{primitive.ObjectID{}, []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06}, false},
 		},
 		{
 			"ReadObjectID/success",
 			ReadObjectID,
 			[]byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
 			[]interface{}{
-				objectid.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
+				primitive.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
 				[]byte{}, true,
 			},
 		},
@@ -639,13 +667,13 @@ func TestRead(t *testing.T) {
 			"ReadDBPointer/not enough bytes (ns)",
 			ReadDBPointer,
 			[]byte{},
-			[]interface{}{"", objectid.ObjectID{}, []byte{}, false},
+			[]interface{}{"", primitive.ObjectID{}, []byte{}, false},
 		},
 		{
 			"ReadDBPointer/not enough bytes (objectID)",
 			ReadDBPointer,
 			[]byte{0x04, 0x00, 0x00, 0x00, 'f', 'o', 'o', 0x00},
-			[]interface{}{"", objectid.ObjectID{}, []byte{0x04, 0x00, 0x00, 0x00, 'f', 'o', 'o', 0x00}, false},
+			[]interface{}{"", primitive.ObjectID{}, []byte{0x04, 0x00, 0x00, 0x00, 'f', 'o', 'o', 0x00}, false},
 		},
 		{
 			"ReadDBPointer/success",
@@ -655,7 +683,7 @@ func TestRead(t *testing.T) {
 				0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
 			},
 			[]interface{}{
-				"foo", objectid.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
+				"foo", primitive.ObjectID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C},
 				[]byte{}, true,
 			},
 		},
@@ -784,13 +812,13 @@ func TestRead(t *testing.T) {
 			"ReadDecimal128/not enough bytes (low)",
 			ReadDecimal128,
 			[]byte{},
-			[]interface{}{decimal.Decimal128{}, []byte{}, false},
+			[]interface{}{primitive.Decimal128{}, []byte{}, false},
 		},
 		{
 			"ReadDecimal128/not enough bytes (high)",
 			ReadDecimal128,
 			[]byte{0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00},
-			[]interface{}{decimal.Decimal128{}, []byte{0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}, false},
+			[]interface{}{primitive.Decimal128{}, []byte{0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}, false},
 		},
 		{
 			"ReadDecimal128/success",
@@ -799,7 +827,7 @@ func TestRead(t *testing.T) {
 				0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
 				0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
 			},
-			[]interface{}{decimal.NewDecimal128(4294967296, 16777216), []byte{}, true},
+			[]interface{}{primitive.NewDecimal128(4294967296, 16777216), []byte{}, true},
 		},
 	}
 
@@ -827,7 +855,51 @@ func TestRead(t *testing.T) {
 	}
 }
 
-func compareDecimal128(d1, d2 decimal.Decimal128) bool {
+func TestBuild(t *testing.T) {
+	testCases := []struct {
+		name  string
+		elems [][]byte
+		want  []byte
+	}{
+		{
+			"one element",
+			[][]byte{AppendDoubleElement(nil, "pi", 3.14159)},
+			[]byte{0x11, 0x00, 0x00, 0x00, 0x1, 0x70, 0x69, 0x00, 0x6e, 0x86, 0x1b, 0xf0, 0xf9, 0x21, 0x9, 0x40, 0x00},
+		},
+		{
+			"two elements",
+			[][]byte{AppendDoubleElement(nil, "pi", 3.14159), AppendStringElement(nil, "hello", "world!!")},
+			[]byte{
+				0x24, 0x00, 0x00, 0x00, 0x01, 0x70, 0x69, 0x00, 0x6e, 0x86, 0x1b, 0xf0,
+				0xf9, 0x21, 0x09, 0x40, 0x02, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x00, 0x08,
+				0x00, 0x00, 0x00, 0x77, 0x6f, 0x72, 0x6c, 0x64, 0x21, 0x21, 0x00, 0x00,
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("BuildDocument", func(t *testing.T) {
+				elems := make([]byte, 0, 0)
+				for _, elem := range tc.elems {
+					elems = append(elems, elem...)
+				}
+				got := BuildDocument(nil, elems)
+				if !bytes.Equal(got, tc.want) {
+					t.Errorf("Documents do not match. got %v; want %v", got, tc.want)
+				}
+			})
+			t.Run("BuildDocumentFromElements", func(t *testing.T) {
+				got := BuildDocumentFromElements(nil, tc.elems...)
+				if !bytes.Equal(got, tc.want) {
+					t.Errorf("Documents do not match. got %v; want %v", got, tc.want)
+				}
+			})
+		})
+	}
+}
+
+func compareDecimal128(d1, d2 primitive.Decimal128) bool {
 	d1H, d1L := d1.GetBytes()
 	d2H, d2L := d2.GetBytes()
 

@@ -8,7 +8,7 @@ package options
 
 import "time"
 
-// AggregateOptions represents all possible options to the aggregate() function
+// AggregateOptions represents all possible options to the Aggregate() function.
 type AggregateOptions struct {
 	AllowDiskUse             *bool          // Enables writing to temporary files. When set to true, aggregation stages can write data to the _tmp subdirectory in the dbPath directory
 	BatchSize                *int32         // The number of documents to return per batch
@@ -62,6 +62,7 @@ func (ao *AggregateOptions) SetMaxTime(d time.Duration) *AggregateOptions {
 
 // SetMaxAwaitTime specifies the maximum amount of time for the server to
 // wait on new documents to satisfy a tailable cursor query
+// For servers < 3.2, this option is ignored
 func (ao *AggregateOptions) SetMaxAwaitTime(d time.Duration) *AggregateOptions {
 	ao.MaxAwaitTime = &d
 	return ao

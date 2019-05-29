@@ -9,24 +9,28 @@ package topology
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/event"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/auth"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/session"
-	"github.com/mongodb/mongo-go-driver/x/network/address"
-	"github.com/mongodb/mongo-go-driver/x/network/command"
-	"github.com/mongodb/mongo-go-driver/x/network/connection"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
+	"go.mongodb.org/mongo-driver/event"
+	"go.mongodb.org/mongo-driver/x/mongo/driver"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
+	connectionlegacy "go.mongodb.org/mongo-driver/x/network/connection"
+	"go.mongodb.org/mongo-driver/x/network/result"
+	"golang.org/x/sync/semaphore"
 )
 
 const minHeartbeatInterval = 500 * time.Millisecond
 const connectionSemaphoreSize = math.MaxInt64
+
+var isMasterOrRecoveringCodes = []int32{11600, 11602, 10107, 13435, 13436, 189, 91}
 
 // ErrServerClosed occurs when an attempt to get a connection is made after
 // the server has been closed.
@@ -37,7 +41,7 @@ var ErrServerClosed = errors.New("server is closed")
 var ErrServerConnected = errors.New("server is connected")
 
 // SelectedServer represents a specific server that was selected during server selection.
-// It contains the kind of the typology it was selected from.
+// It contains the kind of the topology it was selected from.
 type SelectedServer struct {
 	*Server
 
@@ -61,37 +65,57 @@ const (
 	connecting
 )
 
+func connectionStateString(state int32) string {
+	switch state {
+	case 0:
+		return "Disconnected"
+	case 1:
+		return "Disconnecting"
+	case 2:
+		return "Connected"
+	case 3:
+		return "Connecting"
+	}
+
+	return ""
+}
+
 // Server is a single server within a topology.
 type Server struct {
-	cfg     *serverConfig
-	address address.Address
-
+	cfg             *serverConfig
+	address         address.Address
 	connectionstate int32
-	done            chan struct{}
-	checkNow        chan struct{}
-	closewg         sync.WaitGroup
-	pool            connection.Pool
 
-	desc atomic.Value // holds a description.Server
+	// connection related fields
+	pool *pool
+	sem  *semaphore.Weighted
 
-	averageRTTSet bool
-	averageRTT    time.Duration
+	// goroutine management fields
+	done     chan struct{}
+	checkNow chan struct{}
+	closewg  sync.WaitGroup
 
+	// description related fields
+	desc                   atomic.Value // holds a description.Server
+	updateTopologyCallback atomic.Value
+	averageRTTSet          bool
+	averageRTT             time.Duration
+
+	// subscriber related fields
 	subLock             sync.Mutex
 	subscribers         map[uint64]chan description.Server
 	currentSubscriberID uint64
-
 	subscriptionsClosed bool
 }
 
 // ConnectServer creates a new Server and then initializes it using the
 // Connect method.
-func ConnectServer(ctx context.Context, addr address.Address, opts ...ServerOption) (*Server, error) {
+func ConnectServer(addr address.Address, updateCallback func(description.Server), opts ...ServerOption) (*Server, error) {
 	srvr, err := NewServer(addr, opts...)
 	if err != nil {
 		return nil, err
 	}
-	err = srvr.Connect(ctx)
+	err = srvr.Connect(updateCallback)
 	if err != nil {
 		return nil, err
 	}
@@ -106,9 +130,16 @@ func NewServer(addr address.Address, opts ...ServerOption) (*Server, error) {
 		return nil, err
 	}
 
+	var maxConns = uint64(cfg.maxConns)
+	if maxConns == 0 {
+		maxConns = math.MaxInt64
+	}
+
 	s := &Server{
 		cfg:     cfg,
 		address: addr,
+
+		sem: semaphore.NewWeighted(int64(maxConns)),
 
 		done:     make(chan struct{}),
 		checkNow: make(chan struct{}, 1),
@@ -117,31 +148,23 @@ func NewServer(addr address.Address, opts ...ServerOption) (*Server, error) {
 	}
 	s.desc.Store(description.Server{Addr: addr})
 
-	var maxConns uint64
-	if cfg.maxConns == 0 {
-		maxConns = math.MaxInt64
-	} else {
-		maxConns = uint64(cfg.maxConns)
-	}
-
-	s.pool, err = connection.NewPool(addr, uint64(cfg.maxIdleConns), maxConns, cfg.connectionOpts...)
-	if err != nil {
-		return nil, err
-	}
+	callback := func(desc description.Server) { s.updateDescription(desc, false) }
+	s.pool = newPool(addr, uint64(cfg.maxIdleConns), withServerDescriptionCallback(callback, cfg.connectionOpts...)...)
 
 	return s, nil
 }
 
-// Connect initialzies the Server by starting background monitoring goroutines.
+// Connect initializes the Server by starting background monitoring goroutines.
 // This method must be called before a Server can be used.
-func (s *Server) Connect(ctx context.Context) error {
+func (s *Server) Connect(updateCallback func(description.Server)) error {
 	if !atomic.CompareAndSwapInt32(&s.connectionstate, disconnected, connected) {
 		return ErrServerConnected
 	}
 	s.desc.Store(description.Server{Addr: s.address})
+	s.updateTopologyCallback.Store(updateCallback)
 	go s.update()
 	s.closewg.Add(1)
-	return s.pool.Connect(ctx)
+	return s.pool.connect()
 }
 
 // Disconnect closes sockets to the server referenced by this Server.
@@ -158,10 +181,12 @@ func (s *Server) Disconnect(ctx context.Context) error {
 		return ErrServerClosed
 	}
 
+	s.updateTopologyCallback.Store((func(description.Server))(nil))
+
 	// For every call to Connect there must be at least 1 goroutine that is
 	// waiting on the done channel.
 	s.done <- struct{}{}
-	err := s.pool.Disconnect(ctx)
+	err := s.pool.disconnect(ctx)
 	if err != nil {
 		return err
 	}
@@ -173,33 +198,68 @@ func (s *Server) Disconnect(ctx context.Context) error {
 }
 
 // Connection gets a connection to the server.
-func (s *Server) Connection(ctx context.Context) (connection.Connection, error) {
+func (s *Server) Connection(ctx context.Context) (driver.Connection, error) {
 	if atomic.LoadInt32(&s.connectionstate) != connected {
 		return nil, ErrServerClosed
 	}
-	conn, desc, err := s.pool.Get(ctx)
+
+	err := s.sem.Acquire(ctx, 1)
 	if err != nil {
-		if _, ok := err.(*auth.Error); ok {
-			// authentication error --> drain connection
-			_ = s.pool.Drain()
-		}
-		if _, ok := err.(*connection.NetworkError); ok {
-			// update description to unknown and clears the connection pool
-			if desc != nil {
-				desc.Kind = description.Unknown
-				desc.LastError = err
-				s.updateDescription(*desc, false)
-			} else {
-				_ = s.pool.Drain()
-			}
-		}
 		return nil, err
 	}
-	if desc != nil {
-		go s.updateDescription(*desc, false)
+
+	conn, err := s.pool.get(ctx)
+	if err != nil {
+		s.sem.Release(1)
+		connerr, ok := err.(ConnectionError)
+		if !ok {
+			return nil, err
+		}
+
+		// Since the only kind of ConnectionError we receive from pool.get will be an initialization
+		// error, we should set the description.Server appropriately.
+		desc := description.Server{
+			Kind:      description.Unknown,
+			LastError: connerr.Wrapped,
+		}
+		s.updateDescription(desc, false)
+
+		return nil, err
 	}
-	sc := &sconn{Connection: conn, s: s}
-	return sc, nil
+
+	return &Connection{connection: conn, s: s}, nil
+}
+
+// ConnectionLegacy gets a connection to the server.
+func (s *Server) ConnectionLegacy(ctx context.Context) (connectionlegacy.Connection, error) {
+	if atomic.LoadInt32(&s.connectionstate) != connected {
+		return nil, ErrServerClosed
+	}
+
+	err := s.sem.Acquire(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := s.pool.get(ctx)
+	if err != nil {
+		s.sem.Release(1)
+		connerr, ok := err.(ConnectionError)
+		if !ok {
+			return nil, err
+		}
+
+		// Since the only kind of ConnectionError we receive from pool.get will be an initialization
+		// error, we should set the description.Server appropriately.
+		desc := description.Server{
+			Kind:      description.Unknown,
+			LastError: connerr.Wrapped,
+		}
+		s.updateDescription(desc, false)
+
+		return nil, err
+	}
+	return newConnectionLegacy(conn, s, s.cfg.connectionOpts...)
 }
 
 // Description returns a description of the server as of the last heartbeat.
@@ -255,6 +315,65 @@ func (s *Server) RequestImmediateCheck() {
 	}
 }
 
+// ProcessError handles SDAM error handling and implements driver.ErrorProcessor.
+func (s *Server) ProcessError(err error) {
+	// Invalidate server description if not master or node recovering error occurs
+	if cerr, ok := err.(driver.Error); ok && (cerr.NetworkError() || cerr.NodeIsRecovering() || cerr.NotMaster()) {
+		desc := s.Description()
+		desc.Kind = description.Unknown
+		desc.LastError = err
+		// updates description to unknown
+		s.updateDescription(desc, false)
+		s.RequestImmediateCheck()
+		s.pool.drain()
+		return
+	}
+
+	ne, ok := err.(ConnectionError)
+	if !ok {
+		return
+	}
+
+	if netErr, ok := ne.Wrapped.(net.Error); ok && netErr.Timeout() {
+		return
+	}
+	if ne.Wrapped == context.Canceled || ne.Wrapped == context.DeadlineExceeded {
+		return
+	}
+
+	desc := s.Description()
+	desc.Kind = description.Unknown
+	desc.LastError = err
+	// updates description to unknown
+	s.updateDescription(desc, false)
+}
+
+// ProcessWriteConcernError checks if a WriteConcernError is an isNotMaster or
+// isRecovering error, and if so updates the server accordingly.
+func (s *Server) ProcessWriteConcernError(err *result.WriteConcernError) {
+	if err == nil || !wceIsNotMasterOrRecovering(err) {
+		return
+	}
+	desc := s.Description()
+	desc.Kind = description.Unknown
+	desc.LastError = err
+	// updates description to unknown
+	s.updateDescription(desc, false)
+	s.RequestImmediateCheck()
+}
+
+func wceIsNotMasterOrRecovering(wce *result.WriteConcernError) bool {
+	for _, code := range isMasterOrRecoveringCodes {
+		if int32(wce.Code) == code {
+			return true
+		}
+	}
+	if strings.Contains(wce.ErrMsg, "not master") || strings.Contains(wce.ErrMsg, "node is recovering") {
+		return true
+	}
+	return false
+}
+
 // update handles performing heartbeats and updating any subscribers of the
 // newest description.Server retrieved.
 func (s *Server) update() {
@@ -277,7 +396,7 @@ func (s *Server) update() {
 		}
 	}()
 
-	var conn connection.Connection
+	var conn *connection
 	var desc description.Server
 
 	desc, conn = s.heartbeat(nil)
@@ -292,10 +411,10 @@ func (s *Server) update() {
 		}
 		s.subscriptionsClosed = true
 		s.subLock.Unlock()
-		if conn == nil {
+		if conn == nil || conn.nc == nil {
 			return
 		}
-		conn.Close()
+		conn.nc.Close()
 	}
 	for {
 		select {
@@ -329,6 +448,11 @@ func (s *Server) updateDescription(desc description.Server, initial bool) {
 	}()
 	s.desc.Store(desc)
 
+	callback, ok := s.updateTopologyCallback.Load().(func(description.Server))
+	if ok && callback != nil {
+		callback(desc)
+	}
+
 	s.subLock.Lock()
 	for _, c := range s.subscribers {
 		select {
@@ -347,12 +471,12 @@ func (s *Server) updateDescription(desc description.Server, initial bool) {
 
 	switch desc.Kind {
 	case description.Unknown:
-		_ = s.pool.Drain()
+		s.pool.drain()
 	}
 }
 
 // heartbeat sends a heartbeat to the server using the given connection. The connection can be nil.
-func (s *Server) heartbeat(conn connection.Connection) (description.Server, connection.Connection) {
+func (s *Server) heartbeat(conn *connection) (description.Server, *connection) {
 	const maxRetry = 2
 	var saved error
 	var desc description.Server
@@ -361,56 +485,78 @@ func (s *Server) heartbeat(conn connection.Connection) (description.Server, conn
 	ctx := context.Background()
 
 	for i := 1; i <= maxRetry; i++ {
-		if conn != nil && conn.Expired() {
-			conn.Close()
+		if conn != nil && conn.expired() {
+			if conn.nc != nil {
+				conn.nc.Close()
+			}
 			conn = nil
 		}
 
 		if conn == nil {
-			opts := []connection.Option{
-				connection.WithConnectTimeout(func(time.Duration) time.Duration { return s.cfg.heartbeatTimeout }),
-				connection.WithReadTimeout(func(time.Duration) time.Duration { return s.cfg.heartbeatTimeout }),
+			opts := []ConnectionOption{
+				WithConnectTimeout(func(time.Duration) time.Duration { return s.cfg.heartbeatTimeout }),
+				WithReadTimeout(func(time.Duration) time.Duration { return s.cfg.heartbeatTimeout }),
+				WithWriteTimeout(func(time.Duration) time.Duration { return s.cfg.heartbeatTimeout }),
 			}
 			opts = append(opts, s.cfg.connectionOpts...)
 			// We override whatever handshaker is currently attached to the options with an empty
 			// one because need to make sure we don't do auth.
-			opts = append(opts, connection.WithHandshaker(func(h connection.Handshaker) connection.Handshaker {
+			opts = append(opts, WithHandshaker(func(h Handshaker) Handshaker {
 				return nil
 			}))
 
 			// Override any command monitors specified in options with nil to avoid monitoring heartbeats.
-			opts = append(opts, connection.WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
+			opts = append(opts, WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
 				return nil
 			}))
-			conn, _, err = connection.New(ctx, s.address, opts...)
+			conn, err = newConnection(ctx, s.address, opts...)
 			if err != nil {
 				saved = err
-				if conn != nil {
-					conn.Close()
+				if conn != nil && conn.nc != nil {
+					conn.nc.Close()
 				}
 				conn = nil
+				if _, ok := err.(ConnectionError); ok {
+					s.pool.drain()
+					// If the server is not connected, give up and exit loop
+					if s.Description().Kind == description.Unknown {
+						break
+					}
+				}
 				continue
 			}
 		}
 
 		now := time.Now()
 
-		isMasterCmd := &command.IsMaster{Compressors: s.cfg.compressionOpts}
-		isMaster, err := isMasterCmd.RoundTrip(ctx, conn)
+		op := operation.
+			NewIsMaster().
+			ClusterClock(s.cfg.clock).
+			AppName(s.cfg.appname).
+			Compressors(s.cfg.compressionOpts).
+			Deployment(driver.SingleConnectionDeployment{initConnection{conn}})
+		err = op.Execute(ctx)
+		// we do a retry if the server is connected, if succeed return new server desc (see below)
 		if err != nil {
 			saved = err
-			conn.Close()
+			if conn.nc != nil {
+				conn.nc.Close()
+			}
 			conn = nil
+			if _, ok := err.(ConnectionError); ok {
+				s.pool.drain()
+				// If the server is not connected, give up and exit loop
+				if s.Description().Kind == description.Unknown {
+					break
+				}
+			}
 			continue
 		}
 
-		clusterTime := isMaster.ClusterTime
-		if s.cfg.clock != nil {
-			s.cfg.clock.AdvanceClusterTime(clusterTime)
-		}
+		desc = op.Result(s.address)
 
 		delay := time.Since(now)
-		desc = description.NewServer(s.address, isMaster).SetAverageRTT(s.updateAverageRTT(delay))
+		desc = desc.SetAverageRTT(s.updateAverageRTT(delay))
 		desc.HeartbeatInterval = s.cfg.heartbeatInterval
 		set = true
 
@@ -421,6 +567,7 @@ func (s *Server) heartbeat(conn connection.Connection) (description.Server, conn
 		desc = description.Server{
 			Addr:      s.address,
 			LastError: saved,
+			Kind:      description.Unknown,
 		}
 	}
 
@@ -443,11 +590,31 @@ func (s *Server) updateAverageRTT(delay time.Duration) time.Duration {
 // This is exposed here so we don't have to wrap the Connection type and sniff responses
 // for errors that would cause the pool to be drained, which can in turn centralize the
 // logic for handling errors in the Client type.
-func (s *Server) Drain() error { return s.pool.Drain() }
+//
+// TODO(GODRIVER-617): I don't think we actually need this method. It's likely replaced by
+// ProcessError.
+func (s *Server) Drain() error {
+	s.pool.drain()
+	return nil
+}
 
-// BuildCursor implements the command.CursorBuilder interface for the Server type.
-func (s *Server) BuildCursor(result bson.Raw, clientSession *session.Client, clock *session.ClusterClock, opts ...bsonx.Elem) (command.Cursor, error) {
-	return newCursor(result, clientSession, clock, s, opts...)
+// String implements the Stringer interface.
+func (s *Server) String() string {
+	desc := s.Description()
+	connState := atomic.LoadInt32(&s.connectionstate)
+	str := fmt.Sprintf("Addr: %s, Type: %s, State: %s",
+		s.address, desc.Kind, connectionStateString(connState))
+	if len(desc.Tags) != 0 {
+		str += fmt.Sprintf(", Tag sets: %s", desc.Tags)
+	}
+	if connState == connected {
+		str += fmt.Sprintf(", Average RTT: %d", desc.AverageRTT)
+	}
+	if desc.LastError != nil {
+		str += fmt.Sprintf(", Last error: %s", desc.LastError)
+	}
+
+	return str
 }
 
 // ServerSubscription represents a subscription to the description.Server updates for

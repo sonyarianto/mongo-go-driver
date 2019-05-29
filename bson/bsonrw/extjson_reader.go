@@ -11,9 +11,8 @@ import (
 	"io"
 	"sync"
 
-	"github.com/mongodb/mongo-go-driver/bson/bsontype"
-	"github.com/mongodb/mongo-go-driver/bson/decimal"
-	"github.com/mongodb/mongo-go-driver/bson/objectid"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // ExtJSONValueReaderPool is a pool for ValueReaders that read ExtJSON.
@@ -33,10 +32,9 @@ func NewExtJSONValueReaderPool() *ExtJSONValueReaderPool {
 }
 
 // Get retrieves a ValueReader from the pool and uses src as the underlying ExtJSON.
-func (bvrp *ExtJSONValueReaderPool) Get(r io.Reader, canonical bool) ValueReader {
+func (bvrp *ExtJSONValueReaderPool) Get(r io.Reader, canonical bool) (ValueReader, error) {
 	vr := bvrp.pool.Get().(*extJSONValueReader)
-	vr = vr.reset(r, canonical)
-	return vr
+	return vr.reset(r, canonical)
 }
 
 // Put inserts a ValueReader into the pool. If the ValueReader is not a ExtJSON ValueReader nothing
@@ -47,7 +45,7 @@ func (bvrp *ExtJSONValueReaderPool) Put(vr ValueReader) (ok bool) {
 		return false
 	}
 
-	bvr = bvr.reset(nil, false)
+	bvr, _ = bvr.reset(nil, false)
 	bvrp.pool.Put(bvr)
 	return true
 }
@@ -69,22 +67,21 @@ type extJSONValueReader struct {
 // NewExtJSONValueReader creates a new ValueReader from a given io.Reader
 // It will interpret the JSON of r as canonical or relaxed according to the
 // given canonical flag
-func NewExtJSONValueReader(r io.Reader, canonical bool) ValueReader {
+func NewExtJSONValueReader(r io.Reader, canonical bool) (ValueReader, error) {
 	return newExtJSONValueReader(r, canonical)
 }
 
-func newExtJSONValueReader(r io.Reader, canonical bool) *extJSONValueReader {
+func newExtJSONValueReader(r io.Reader, canonical bool) (*extJSONValueReader, error) {
 	ejvr := new(extJSONValueReader)
 	return ejvr.reset(r, canonical)
 }
 
-func (ejvr *extJSONValueReader) reset(r io.Reader, canonical bool) *extJSONValueReader {
+func (ejvr *extJSONValueReader) reset(r io.Reader, canonical bool) (*extJSONValueReader, error) {
 	p := newExtJSONParser(r, canonical)
 	typ, err := p.peekType()
 
 	if err != nil {
-		// TODO: invalid JSON--return error message?
-		return nil
+		return nil, ErrInvalidJSON
 	}
 
 	var m mode
@@ -105,7 +102,7 @@ func (ejvr *extJSONValueReader) reset(r io.Reader, canonical bool) *extJSONValue
 	return &extJSONValueReader{
 		p:     p,
 		stack: stack,
-	}
+	}, nil
 }
 
 func (ejvr *extJSONValueReader) advanceFrame() {
@@ -353,14 +350,14 @@ func (ejvr *extJSONValueReader) ReadCodeWithScope() (code string, dr DocumentRea
 	return code, ejvr, err
 }
 
-func (ejvr *extJSONValueReader) ReadDBPointer() (ns string, oid objectid.ObjectID, err error) {
+func (ejvr *extJSONValueReader) ReadDBPointer() (ns string, oid primitive.ObjectID, err error) {
 	if err = ejvr.ensureElementValue(bsontype.DBPointer, 0, "ReadDBPointer"); err != nil {
-		return "", objectid.NilObjectID, err
+		return "", primitive.NilObjectID, err
 	}
 
 	v, err := ejvr.p.readValue(bsontype.DBPointer)
 	if err != nil {
-		return "", objectid.NilObjectID, err
+		return "", primitive.NilObjectID, err
 	}
 
 	ns, oid, err = v.parseDBPointer()
@@ -385,14 +382,14 @@ func (ejvr *extJSONValueReader) ReadDateTime() (int64, error) {
 	return d, err
 }
 
-func (ejvr *extJSONValueReader) ReadDecimal128() (decimal.Decimal128, error) {
+func (ejvr *extJSONValueReader) ReadDecimal128() (primitive.Decimal128, error) {
 	if err := ejvr.ensureElementValue(bsontype.Decimal128, 0, "ReadDecimal128"); err != nil {
-		return decimal.Decimal128{}, err
+		return primitive.Decimal128{}, err
 	}
 
 	v, err := ejvr.p.readValue(bsontype.Decimal128)
 	if err != nil {
-		return decimal.Decimal128{}, err
+		return primitive.Decimal128{}, err
 	}
 
 	d, err := v.parseDecimal128()
@@ -515,14 +512,14 @@ func (ejvr *extJSONValueReader) ReadNull() error {
 	return nil
 }
 
-func (ejvr *extJSONValueReader) ReadObjectID() (objectid.ObjectID, error) {
+func (ejvr *extJSONValueReader) ReadObjectID() (primitive.ObjectID, error) {
 	if err := ejvr.ensureElementValue(bsontype.ObjectID, 0, "ReadObjectID"); err != nil {
-		return objectid.ObjectID{}, err
+		return primitive.ObjectID{}, err
 	}
 
 	v, err := ejvr.p.readValue(bsontype.ObjectID)
 	if err != nil {
-		return objectid.ObjectID{}, err
+		return primitive.ObjectID{}, err
 	}
 
 	oid, err := v.parseObjectID()

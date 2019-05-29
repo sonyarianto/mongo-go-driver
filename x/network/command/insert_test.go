@@ -9,9 +9,9 @@ package command
 import (
 	"testing"
 
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
 	"github.com/stretchr/testify/assert"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
 )
 
 func TestInsertCommandSplitting(t *testing.T) {

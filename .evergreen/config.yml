@@ -29,16 +29,16 @@ functions:
     - command: git.get_project
       type: system
       params:
-        directory: src/github.com/mongodb/mongo-go-driver
+        directory: src/go.mongodb.org/mongo-driver
     # Make an evergreen expansion file with dynamic values
     - command: shell.exec
       params:
-        working_dir: src/github.com/mongodb/mongo-go-driver
+        working_dir: src/go.mongodb.org/mongo-driver
         script: |
            if [ "Windows_NT" = "$OS" ]; then
-              export GOPATH=$(cygpath -w $(dirname $(dirname $(dirname $(dirname `pwd`)))))
+              export GOPATH=$(cygpath -w $(dirname $(dirname $(dirname `pwd`))))
            else
-              export GOPATH=$(dirname $(dirname $(dirname $(dirname `pwd`))))
+              export GOPATH=$(dirname $(dirname $(dirname `pwd`)))
            fi;
 
            # Get the current unique version of this checkout
@@ -50,11 +50,13 @@ functions:
 
            export DRIVERS_TOOLS="$(pwd)/../drivers-tools"
            export PROJECT_DIRECTORY="$(pwd)"
+           export GOCACHE="$(pwd)/.cache"
 
            # Python has cygwin path problems on Windows. Detect prospective mongo-orchestration home directory
            if [ "Windows_NT" = "$OS" ]; then # Magic variable in cygwin
               export DRIVERS_TOOLS=$(cygpath -m $DRIVERS_TOOLS)
               export PROJECT_DIRECTORY=$(cygpath -m $PROJECT_DIRECTORY)
+              export GOCACHE=$(cygpath -m $GOCACHE)
            fi
 
            export MONGO_ORCHESTRATION_HOME="$DRIVERS_TOOLS/.evergreen/orchestration"
@@ -64,8 +66,8 @@ functions:
            export PROJECT="${project}"
 
            if [ "Windows_NT" = "$OS" ]; then
-              export USERPROFILE=$(cygpath -w $(dirname $(dirname $(dirname $(dirname `pwd`)))))
-              export HOME=$(cygpath -w $(dirname $(dirname $(dirname $(dirname `pwd`)))))
+              export USERPROFILE=$(cygpath -w $(dirname $(dirname $(dirname `pwd`))))
+              export HOME=$(cygpath -w $(dirname $(dirname $(dirname `pwd`))))
            fi
 
            go version
@@ -83,6 +85,7 @@ functions:
               set -o xtrace
               export GOPATH="$GOPATH"
               export GOROOT="${GO_DIST}"
+              export GOCACHE="$GOCACHE"
               export DRIVERS_TOOLS="$DRIVERS_TOOLS"
               export MONGO_ORCHESTRATION_HOME="$MONGO_ORCHESTRATION_HOME"
               export MONGODB_BINARIES="$MONGODB_BINARIES"
@@ -97,7 +100,7 @@ functions:
     # Load the expansion file to make an evergreen variable with the current unique version
     - command: expansions.update
       params:
-        file: src/github.com/mongodb/mongo-go-driver/expansion.yml
+        file: src/go.mongodb.org/mongo-driver/expansion.yml
 
 
   prepare-resources:
@@ -115,7 +118,7 @@ functions:
           echo "{ \"releases\": { \"default\": \"$MONGODB_BINARIES\" }}" > $MONGO_ORCHESTRATION_HOME/orchestration.config
     - command: shell.exec
       params:
-        working_dir: src/github.com/mongodb/mongo-go-driver
+        working_dir: src/go.mongodb.org/mongo-driver
         script: |
            ${PREPARE_SHELL}
            # any go tools that we need
@@ -216,7 +219,7 @@ functions:
     - command: shell.exec
       type: test
       params:
-        working_dir: src/github.com/mongodb/mongo-go-driver
+        working_dir: src/go.mongodb.org/mongo-driver
         script: |
           ${PREPARE_SHELL}
           ${BUILD_ENV|} make ${targets} BUILD_TAGS="-tags gssapi"
@@ -226,7 +229,7 @@ functions:
     - command: shell.exec
       type: test
       params:
-        working_dir: src/github.com/mongodb/mongo-go-driver
+        working_dir: src/go.mongodb.org/mongo-driver
         script: |
           ${PREPARE_SHELL}
 
@@ -245,7 +248,7 @@ functions:
    - command: json.send
      params:
        name: perf
-       file: src/github.com/mongodb/mongo-go-driver/perf.json
+       file: src/go.mongodb.org/mongo-driver/perf.json
 
 
   run-enterprise-auth-tests:
@@ -253,16 +256,19 @@ functions:
       type: test
       params:
         silent: true
-        working_dir: src/github.com/mongodb/mongo-go-driver
+        working_dir: src/go.mongodb.org/mongo-driver
         script: |
           # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
           if [ "Windows_NT" = "$OS" ]; then
-            export GOPATH=$(cygpath -w $(dirname $(dirname $(dirname $(dirname `pwd`)))))
+            export GOPATH=$(cygpath -w $(dirname $(dirname $(dirname `pwd`))))
+            export GOCACHE=$(cygpath -w "$(pwd)/.cache")
           else
-            export GOPATH=$(dirname $(dirname $(dirname $(dirname `pwd`))))
+            export GOPATH=$(dirname $(dirname $(dirname `pwd`)))
+            export GOCACHE="$(pwd)/.cache"
           fi;
           export GOPATH="$GOPATH"
           export GOROOT="${GO_DIST}"
+          export GOCACHE="$GOCACHE"
           export PATH="${GCC_PATH}:${GO_DIST}/bin:$PATH"
           MONGODB_URI="${MONGODB_URI}" MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}" make -s evg-test-auth
 
@@ -270,15 +276,16 @@ functions:
     - command: shell.exec
       type: test
       params:
-        silent: true
-        working_dir: src/github.com/mongodb/mongo-go-driver
+        working_dir: src/go.mongodb.org/mongo-driver
         script: |
           # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
           if [ "Windows_NT" = "$OS" ]; then
-            export GOPATH=$(cygpath -w $(dirname $(dirname $(dirname $(dirname `pwd`)))))
+            export GOPATH=$(cygpath -w $(dirname $(dirname $(dirname `pwd`))))
+            export GOCACHE=$(cygpath -w "$(pwd)/.cache")
             export MONGODB_URI=${gssapi_auth_windows_mongodb_uri}
           else
-            export GOPATH=$(dirname $(dirname $(dirname $(dirname `pwd`))))
+            export GOPATH=$(dirname $(dirname $(dirname `pwd`)))
+            export GOCACHE="$(pwd)/.cache"
             echo "${gssapi_auth_linux_keytab_base64}" > /tmp/drivers.keytab.base64
             base64 --decode /tmp/drivers.keytab.base64 > ${PROJECT_DIRECTORY}/.evergreen/drivers.keytab
             mkdir -p ~/.krb5
@@ -288,6 +295,34 @@ functions:
           fi;
           export GOPATH="$GOPATH"
           export GOROOT="${GO_DIST}"
+          export GOCACHE="$GOCACHE"
+          export PATH="${GCC_PATH}:${GO_DIST}/bin:$PATH"
+          MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}" make -s evg-test-auth
+
+  run-enterprise-gssapi-service-host-auth-tests:
+    - command: shell.exec
+      type: test
+      params:
+        working_dir: src/go.mongodb.org/mongo-driver
+        script: |
+          # DO NOT ECHO WITH XTRACE (which PREPARE_SHELL does)
+          if [ "Windows_NT" = "$OS" ]; then
+            export GOPATH=$(cygpath -w $(dirname $(dirname $(dirname `pwd`))))
+            export GOCACHE=$(cygpath -w "$(pwd)/.cache")
+            export MONGODB_URI="${gssapi_service_host_auth_windows_mongodb_uri}"
+          else
+            export GOPATH=$(dirname $(dirname $(dirname `pwd`)))
+            export GOCACHE="$(pwd)/.cache"
+            echo "${gssapi_auth_linux_keytab_base64}" > /tmp/drivers.keytab.base64
+            base64 --decode /tmp/drivers.keytab.base64 > ${PROJECT_DIRECTORY}/.evergreen/drivers.keytab
+            mkdir -p ~/.krb5
+            cat .evergreen/krb5.config | tee -a ~/.krb5/config
+            kinit -k -t ${PROJECT_DIRECTORY}/.evergreen/drivers.keytab -p "${gssapi_auth_username}"
+            export MONGODB_URI="${gssapi_service_host_auth_linux_mongodb_uri}"
+          fi;
+          export GOPATH="$GOPATH"
+          export GOROOT="${GO_DIST}"
+          export GOCACHE="$GOCACHE"
           export PATH="${GCC_PATH}:${GO_DIST}/bin:$PATH"
           MONGO_GO_DRIVER_COMPRESSOR="${MONGO_GO_DRIVER_COMPRESSOR}" make -s evg-test-auth
 
@@ -302,7 +337,7 @@ post:
   - command: gotest.parse_files
     params:
       files:
-        - "src/github.com/mongodb/mongo-go-driver/*.suite"
+        - "src/go.mongodb.org/mongo-driver/*.suite"
   - func: upload-mo-artifacts
   - func: cleanup
 
@@ -371,8 +406,8 @@ tasks:
             AUTH: "noauth"
             SSL: "nossl"
 
-    - name: test-standalone-noauth-nossl-compression
-      tags: ["test", "standalone", "compression"]
+    - name: test-standalone-noauth-nossl-snappy-compression
+      tags: ["test", "standalone", "compression", "snappy"]
       commands:
         - func: bootstrap-mongo-orchestration
           vars:
@@ -385,9 +420,24 @@ tasks:
             AUTH: "noauth"
             SSL: "nossl"
             MONGO_GO_DRIVER_COMPRESSOR: "snappy"
+
+    - name: test-standalone-noauth-nossl-zlib-compression
+      tags: ["test", "standalone", "compression", "zlib"]
+      commands:
+        - func: bootstrap-mongo-orchestration
+          vars:
+            TOPOLOGY: "server"
+            AUTH: "noauth"
+            SSL: "nossl"
+        - func: run-tests
+          vars:
+            TOPOLOGY: "server"
+            AUTH: "noauth"
+            SSL: "nossl"
+            MONGO_GO_DRIVER_COMPRESSOR: "zlib"
 
     - name: test-standalone-auth-ssl
-      tags: ["test", "standalone"]
+      tags: ["test", "standalone", "authssl"]
       commands:
         - func: bootstrap-mongo-orchestration
           vars:
@@ -400,8 +450,8 @@ tasks:
             AUTH: "auth"
             SSL: "ssl"
 
-    - name: test-standalone-auth-ssl-compression
-      tags: ["test", "standalone"]
+    - name: test-standalone-auth-ssl-snappy-compression
+      tags: ["test", "standalone", "authssl", "compression", "snappy"]
       commands:
         - func: bootstrap-mongo-orchestration
           vars:
@@ -414,6 +464,21 @@ tasks:
             AUTH: "auth"
             SSL: "ssl"
             MONGO_GO_DRIVER_COMPRESSOR: "snappy"
+
+    - name: test-standalone-auth-ssl-zlib-compression
+      tags: ["test", "standalone", "authssl", "compression", "zlib"]
+      commands:
+        - func: bootstrap-mongo-orchestration
+          vars:
+            TOPOLOGY: "server"
+            AUTH: "auth"
+            SSL: "ssl"
+        - func: run-tests
+          vars:
+            TOPOLOGY: "server"
+            AUTH: "auth"
+            SSL: "ssl"
+            MONGO_GO_DRIVER_COMPRESSOR: "zlib"
 
     - name: test-replicaset-noauth-nossl
       tags: ["test", "replicaset"]
@@ -429,23 +494,8 @@ tasks:
             AUTH: "noauth"
             SSL: "nossl"
 
-    - name: test-replicaset-noauth-nossl-compression
-      tags: ["test", "replicaset"]
-      commands:
-        - func: bootstrap-mongo-orchestration
-          vars:
-            TOPOLOGY: "replica_set"
-            AUTH: "noauth"
-            SSL: "nossl"
-        - func: run-tests
-          vars:
-            TOPOLOGY: "replica_set"
-            AUTH: "noauth"
-            SSL: "nossl"
-            MONGO_GO_DRIVER_COMPRESSOR: "snappy"
-
     - name: test-replicaset-auth-ssl
-      tags: ["test", "replicaset"]
+      tags: ["test", "replicaset", "authssl"]
       commands:
         - func: bootstrap-mongo-orchestration
           vars:
@@ -457,21 +507,6 @@ tasks:
             TOPOLOGY: "replica_set"
             AUTH: "auth"
             SSL: "ssl"
-
-    - name: test-replicaset-auth-ssl-compression
-      tags: ["test", "replicaset"]
-      commands:
-        - func: bootstrap-mongo-orchestration
-          vars:
-            TOPOLOGY: "replica_set"
-            AUTH: "auth"
-            SSL: "ssl"
-        - func: run-tests
-          vars:
-            TOPOLOGY: "replica_set"
-            AUTH: "auth"
-            SSL: "ssl"
-            MONGO_GO_DRIVER_COMPRESSOR: "snappy"
 
     - name: test-sharded-noauth-nossl
       tags: ["test", "sharded"]
@@ -487,8 +522,8 @@ tasks:
             AUTH: "noauth"
             SSL: "nossl"
 
-    - name: test-sharded-noauth-nossl-compression
-      tags: ["test", "sharded"]
+    - name: test-sharded-noauth-nossl-snappy-compression
+      tags: ["test", "sharded", "compression", "snappy"]
       commands:
         - func: bootstrap-mongo-orchestration
           vars:
@@ -501,9 +536,24 @@ tasks:
             AUTH: "noauth"
             SSL: "nossl"
             MONGO_GO_DRIVER_COMPRESSOR: "snappy"
+
+    - name: test-sharded-noauth-nossl-zlib-compression
+      tags: ["test", "sharded", "compression", "zlib"]
+      commands:
+        - func: bootstrap-mongo-orchestration
+          vars:
+            TOPOLOGY: "sharded_cluster"
+            AUTH: "noauth"
+            SSL: "nossl"
+        - func: run-tests
+          vars:
+            TOPOLOGY: "sharded_cluster"
+            AUTH: "noauth"
+            SSL: "nossl"
+            MONGO_GO_DRIVER_COMPRESSOR: "zlib"
 
     - name: test-sharded-auth-ssl
-      tags: ["test", "sharded"]
+      tags: ["test", "sharded", "authssl"]
       commands:
         - func: bootstrap-mongo-orchestration
           vars:
@@ -516,8 +566,8 @@ tasks:
             AUTH: "auth"
             SSL: "ssl"
 
-    - name: test-sharded-auth-ssl-compression
-      tags: ["test", "sharded"]
+    - name: test-sharded-auth-ssl-snappy-compression
+      tags: ["test", "sharded", "authssl", "compression", "snappy"]
       commands:
         - func: bootstrap-mongo-orchestration
           vars:
@@ -530,6 +580,21 @@ tasks:
             AUTH: "auth"
             SSL: "ssl"
             MONGO_GO_DRIVER_COMPRESSOR: "snappy"
+
+    - name: test-sharded-auth-ssl-zlib-compression
+      tags: ["test", "sharded", "authssl", "compression", "zlib"]
+      commands:
+        - func: bootstrap-mongo-orchestration
+          vars:
+            TOPOLOGY: "sharded_cluster"
+            AUTH: "auth"
+            SSL: "ssl"
+        - func: run-tests
+          vars:
+            TOPOLOGY: "sharded_cluster"
+            AUTH: "auth"
+            SSL: "ssl"
+            MONGO_GO_DRIVER_COMPRESSOR: "zlib"
 
     - name: test-enterprise-auth-plain
       tags: ["test", "enterprise-auth"]
@@ -538,18 +603,15 @@ tasks:
           vars:
             MONGODB_URI: "${plain_auth_mongodb_uri}"
 
-    - name: test-enterprise-auth-plain-compression
-      tags: ["test", "enterprise-auth"]
-      commands:
-        - func: run-enterprise-auth-tests
-          vars:
-            MONGODB_URI: "${plain_auth_mongodb_uri}"
-            MONGO_GO_DRIVER_COMPRESSOR: "snappy"
-
     - name: test-enterprise-auth-gssapi
       tags: ["test", "enterprise-auth"]
       commands:
         - func: run-enterprise-gssapi-auth-tests
+
+    - name: test-enterprise-auth-gssapi-service-host
+      tags: ["test", "enterprise-auth"]
+      commands:
+        - func: run-enterprise-gssapi-service-host-auth-tests
           vars:
             MONGO_GO_DRIVER_COMPRESSOR: "snappy"
 
@@ -613,31 +675,50 @@ axes:
         display_name: "3.2"
         variables:
            VERSION: "3.2"
+      - id: "3.0"
+        display_name: "3.0"
+        variables:
+          VERSION: "3.0"
+      - id: "2.6"
+        display_name: "2.6"
+        variables:
+          VERSION: "2.6"
       - id: "latest"
         display_name: "latest"
         variables:
            VERSION: "latest"
 
-  - id: os
+  # OSes that support versions of MongoDB >= 2.6 with SSL.
+  - id: os-ssl-legacy
     display_name: OS
     values:
-      - id: "windows-64-go-1-11"
+      - id: "ubuntu1404-go-1-12"
+        display_name: "Ubuntu 14.04"
+        run_on: ubuntu1404-test
+        variables:
+          GO_DIST: "/opt/golang/go1.12"
+
+  # OSes that require >= 3.2 for SSL
+  - id: os-ssl-32
+    display_name: OS
+    values:
+      - id: "windows-64-go-1-12"
         display_name: "Windows 64-bit"
         run_on:
           - windows-64-vs2015-test
         variables:
           GCC_PATH: "/cygdrive/c/mingw-w64/x86_64-4.9.1-posix-seh-rt_v3-rev1/mingw64/bin"
-          GO_DIST: "C:\\golang\\go1.11"
-      - id: "ubuntu1604-64-go-1-11"
+          GO_DIST: "C:\\golang\\go1.12"
+      - id: "ubuntu1604-64-go-1-12"
         display_name: "Ubuntu 16.04"
         run_on: ubuntu1604-build
         variables:
-          GO_DIST: "/opt/golang/go1.11"
-      - id: "osx-go-1-11"
+          GO_DIST: "/opt/golang/go1.12"
+      - id: "osx-go-1-12"
         display_name: "MacOS 10.12"
         run_on: macos-1012
         variables:
-          GO_DIST: "/opt/golang/go1.11"
+          GO_DIST: "/opt/golang/go1.12"
 
 
 buildvariants:
@@ -646,7 +727,7 @@ buildvariants:
   run_on:
     - ubuntu1604-build
   expansions:
-    GO_DIST: "/opt/golang/go1.9"
+    GO_DIST: "/opt/golang/go1.12"
   tasks:
     - name: ".static-analysis"
 
@@ -655,7 +736,7 @@ buildvariants:
   run_on:
     - ubuntu1604-build
   expansions:
-    GO_DIST: "/opt/golang/go1.9"
+    GO_DIST: "/opt/golang/go1.12"
   tasks:
     - name: ".performance"
 
@@ -664,18 +745,42 @@ buildvariants:
   run_on:
     - ubuntu1604-test
   expansions:
-    GO_DIST: "/opt/golang/go1.10"
+    GO_DIST: "/opt/golang/go1.12"
   tasks:
     - name: ".compile-check"
 
-- matrix_name: "tests"
-  matrix_spec: { version: "*", os: "*" }
-  display_name: "${version} ${os}"
+- matrix_name: "tests-legacy-auth-ssl"
+  matrix_spec: { version: ["2.6", "3.0"], os-ssl-legacy: "*" }
+  display_name: "${version} ${os-ssl-legacy}"
   tasks:
-     - name: ".test !.enterprise-auth"
+    - name: ".test !.enterprise-auth !.compression"
+
+- matrix_name: "tests-legacy-noauth-nossl"
+  matrix_spec: { version: ["2.6", "3.0"], os-ssl-32: "*" }
+  display_name: "${version} ${os-ssl-32}"
+  tasks:
+    - name: ".test !.authssl !.enterprise-auth !.compression"
+
+- matrix_name: "tests-nonlegacy-servers"
+  matrix_spec: { version: "3.2", os-ssl-32: "*" }
+  display_name: "${version} ${os-ssl-32}"
+  tasks:
+    - name: ".test !.enterprise-auth !.compression"
+
+- matrix_name: "tests-nonlegacy-servers-with-snappy-support"
+  matrix_spec: { version: "3.4", os-ssl-32: "*" }
+  display_name: "${version} ${os-ssl-32}"
+  tasks:
+    - name: ".test !.enterprise-auth !.zlib"
+
+- matrix_name: "tests-nonlegacy-servers-with-zlib-support"
+  matrix_spec: { version: ["3.6", "4.0", "latest"], os-ssl-32: "*" }
+  display_name: "${version} ${os-ssl-32}"
+  tasks:
+    - name: ".test !.enterprise-auth"
 
 - matrix_name: "enterprise-auth-tests"
-  matrix_spec: { os: "*" }
-  display_name: "Enterprise Auth - ${os}"
+  matrix_spec: { os-ssl-32: "*" }
+  display_name: "Enterprise Auth - ${os-ssl-32}"
   tasks:
      - name: ".test .enterprise-auth"

@@ -10,11 +10,12 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/topology"
-	"github.com/mongodb/mongo-go-driver/x/network/connection"
-	"github.com/mongodb/mongo-go-driver/x/network/connstring"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/x/network/connection"
 )
 
 func TestTopologyTopology(t *testing.T) {
@@ -30,7 +31,7 @@ func TestTopologyTopology(t *testing.T) {
 		t.Run("cannot disconnect twice", func(t *testing.T) {
 			topo, err := topology.New(topology.WithConnString(func(connstring.ConnString) connstring.ConnString { return connectionString }))
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
 			err = topo.Disconnect(context.TODO())
 			noerr(t, err)
@@ -48,24 +49,24 @@ func TestTopologyTopology(t *testing.T) {
 				topology.WithServerOptions(func(opts ...topology.ServerOption) []topology.ServerOption {
 					return append(
 						opts,
-						topology.WithConnectionOptions(func(opts ...connection.Option) []connection.Option {
+						topology.WithConnectionOptions(func(opts ...topology.ConnectionOption) []topology.ConnectionOption {
 							return append(
 								opts,
-								connection.WithDialer(func(connection.Dialer) connection.Dialer { return d }),
+								topology.WithDialer(func(topology.Dialer) topology.Dialer { return d }),
 							)
 						}),
 					)
 				}),
 			)
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
-			ss, err := topo.SelectServer(context.TODO(), description.WriteSelector())
+			ss, err := topo.SelectServerLegacy(context.TODO(), description.WriteSelector())
 			noerr(t, err)
 
 			conns := [3]connection.Connection{}
 			for idx := range [3]struct{}{} {
-				conns[idx], err = ss.Connection(context.TODO())
+				conns[idx], err = ss.ConnectionLegacy(context.TODO())
 				noerr(t, err)
 			}
 			for idx := range [2]struct{}{} {
@@ -85,6 +86,40 @@ func TestTopologyTopology(t *testing.T) {
 					d.lenclosed(), d.lenopened())
 			}
 		})
+		t.Run("can disconnect from hung server", func(t *testing.T) {
+			bctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			start := make(chan struct{}, 1)
+			addr := bootstrapConnections(t, 5, func(_ net.Conn) {
+				start <- struct{}{}
+				<-bctx.Done()
+			})
+			topo, err := topology.New(
+				topology.WithConnString(
+					func(connstring.ConnString) connstring.ConnString {
+						cs, err := connstring.Parse("mongodb://" + addr.String() + "/")
+						noerr(t, err)
+						cs.ConnectTimeout = 20 * time.Millisecond
+						return cs
+					},
+				),
+			)
+			noerr(t, err)
+			err = topo.Connect()
+			noerr(t, err)
+			<-start
+			done := make(chan struct{}, 1)
+			go func() {
+				err := topo.Disconnect(bctx)
+				noerr(t, err)
+				done <- struct{}{}
+			}()
+			select {
+			case <-done:
+			case <-time.After(300 * time.Millisecond):
+				t.Error("Could not disconnect a topology within required timelimit")
+			}
+		})
 	})
 	t.Run("Connect", func(t *testing.T) {
 		t.Run("can reconnect a disconnected topology", func(t *testing.T) {
@@ -94,11 +129,11 @@ func TestTopologyTopology(t *testing.T) {
 				),
 			)
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
 			err = topo.Disconnect(context.TODO())
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
 		})
 		t.Run("cannot connect multiple times without disconnect", func(t *testing.T) {
@@ -108,13 +143,13 @@ func TestTopologyTopology(t *testing.T) {
 				),
 			)
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
 			err = topo.Disconnect(context.TODO())
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			if err != topology.ErrTopologyConnected {
 				t.Errorf("Expected a topology connected error. got %v; want %v", err, topology.ErrTopologyConnected)
 			}
@@ -126,22 +161,22 @@ func TestTopologyTopology(t *testing.T) {
 				),
 			)
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
 
 			err = topo.Disconnect(context.TODO())
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
 
 			err = topo.Disconnect(context.TODO())
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
 
 			err = topo.Disconnect(context.TODO())
 			noerr(t, err)
-			err = topo.Connect(context.TODO())
+			err = topo.Connect()
 			noerr(t, err)
 		})
 	})

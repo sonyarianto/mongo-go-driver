@@ -17,9 +17,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/mongodb/mongo-go-driver/bson/bsontype"
-	"github.com/mongodb/mongo-go-driver/bson/decimal"
-	"github.com/mongodb/mongo-go-driver/bson/objectid"
+	"go.mongodb.org/mongo-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // ElementTypeError specifies that a method to obtain a BSON value an incorrect type was called on a bson.Value.
@@ -62,25 +61,139 @@ func (v Value) IsNumber() bool {
 // will panic.
 //
 // TODO(skriptble): Add support for Decimal128.
-func (v Value) AsInt32() int32 { return 0 }
+func (v Value) AsInt32() int32 {
+	if !v.IsNumber() {
+		panic(ElementTypeError{"bsoncore.Value.AsInt32", v.Type})
+	}
+	var i32 int32
+	switch v.Type {
+	case bsontype.Double:
+		f64, _, ok := ReadDouble(v.Data)
+		if !ok {
+			panic(NewInsufficientBytesError(v.Data, v.Data))
+		}
+		i32 = int32(f64)
+	case bsontype.Int32:
+		var ok bool
+		i32, _, ok = ReadInt32(v.Data)
+		if !ok {
+			panic(NewInsufficientBytesError(v.Data, v.Data))
+		}
+	case bsontype.Int64:
+		i64, _, ok := ReadInt64(v.Data)
+		if !ok {
+			panic(NewInsufficientBytesError(v.Data, v.Data))
+		}
+		i32 = int32(i64)
+	case bsontype.Decimal128:
+		panic(ElementTypeError{"bsoncore.Value.AsInt32", v.Type})
+	}
+	return i32
+}
 
 // AsInt32OK functions the same as AsInt32 but returns a boolean instead of panicking. False
 // indicates an error.
 //
 // TODO(skriptble): Add support for Decimal128.
-func (v Value) AsInt32OK() (int32, bool) { return 0, false }
+func (v Value) AsInt32OK() (int32, bool) {
+	if !v.IsNumber() {
+		return 0, false
+	}
+	var i32 int32
+	switch v.Type {
+	case bsontype.Double:
+		f64, _, ok := ReadDouble(v.Data)
+		if !ok {
+			return 0, false
+		}
+		i32 = int32(f64)
+	case bsontype.Int32:
+		var ok bool
+		i32, _, ok = ReadInt32(v.Data)
+		if !ok {
+			return 0, false
+		}
+	case bsontype.Int64:
+		i64, _, ok := ReadInt64(v.Data)
+		if !ok {
+			return 0, false
+		}
+		i32 = int32(i64)
+	case bsontype.Decimal128:
+		return 0, false
+	}
+	return i32, true
+}
 
 // AsInt64 returns a BSON number as an int64. If the BSON type is not a numeric one, this method
 // will panic.
 //
 // TODO(skriptble): Add support for Decimal128.
-func (v Value) AsInt64() int64 { return 0 }
+func (v Value) AsInt64() int64 {
+	if !v.IsNumber() {
+		panic(ElementTypeError{"bsoncore.Value.AsInt64", v.Type})
+	}
+	var i64 int64
+	switch v.Type {
+	case bsontype.Double:
+		f64, _, ok := ReadDouble(v.Data)
+		if !ok {
+			panic(NewInsufficientBytesError(v.Data, v.Data))
+		}
+		i64 = int64(f64)
+	case bsontype.Int32:
+		var ok bool
+		i32, _, ok := ReadInt32(v.Data)
+		if !ok {
+			panic(NewInsufficientBytesError(v.Data, v.Data))
+		}
+		i64 = int64(i32)
+	case bsontype.Int64:
+		var ok bool
+		i64, _, ok = ReadInt64(v.Data)
+		if !ok {
+			panic(NewInsufficientBytesError(v.Data, v.Data))
+		}
+	case bsontype.Decimal128:
+		panic(ElementTypeError{"bsoncore.Value.AsInt64", v.Type})
+	}
+	return i64
+}
 
 // AsInt64OK functions the same as AsInt64 but returns a boolean instead of panicking. False
 // indicates an error.
 //
 // TODO(skriptble): Add support for Decimal128.
-func (v Value) AsInt64OK() (int64, bool) { return 0, false }
+func (v Value) AsInt64OK() (int64, bool) {
+	if !v.IsNumber() {
+		return 0, false
+	}
+	var i64 int64
+	switch v.Type {
+	case bsontype.Double:
+		f64, _, ok := ReadDouble(v.Data)
+		if !ok {
+			return 0, false
+		}
+		i64 = int64(f64)
+	case bsontype.Int32:
+		var ok bool
+		i32, _, ok := ReadInt32(v.Data)
+		if !ok {
+			return 0, false
+		}
+		i64 = int64(i32)
+	case bsontype.Int64:
+		var ok bool
+		i64, _, ok = ReadInt64(v.Data)
+		if !ok {
+			return 0, false
+		}
+	case bsontype.Decimal128:
+		return 0, false
+	}
+	return i64, true
+}
 
 // AsFloat64 returns a BSON number as an float64. If the BSON type is not a numeric one, this method
 // will panic.
@@ -151,7 +264,7 @@ func (v Value) String() string {
 		if !ok {
 			return ""
 		}
-		return fmt.Sprintf(`{"$oid":%s}`, oid.Hex())
+		return fmt.Sprintf(`{"$oid":"%s"}`, oid.Hex())
 	case bsontype.Boolean:
 		b, ok := v.BooleanOK()
 		if !ok {
@@ -403,7 +516,7 @@ func (v Value) BinaryOK() (subtype byte, data []byte, ok bool) {
 
 // ObjectID returns the BSON objectid value the Value represents. It panics if the value is a BSON
 // type other than objectid.
-func (v Value) ObjectID() objectid.ObjectID {
+func (v Value) ObjectID() primitive.ObjectID {
 	if v.Type != bsontype.ObjectID {
 		panic(ElementTypeError{"bsoncore.Value.ObjectID", v.Type})
 	}
@@ -416,13 +529,13 @@ func (v Value) ObjectID() objectid.ObjectID {
 
 // ObjectIDOK is the same as ObjectID, except it returns a boolean instead of
 // panicking.
-func (v Value) ObjectIDOK() (objectid.ObjectID, bool) {
+func (v Value) ObjectIDOK() (primitive.ObjectID, bool) {
 	if v.Type != bsontype.ObjectID {
-		return objectid.ObjectID{}, false
+		return primitive.ObjectID{}, false
 	}
 	oid, _, ok := ReadObjectID(v.Data)
 	if !ok {
-		return objectid.ObjectID{}, false
+		return primitive.ObjectID{}, false
 	}
 	return oid, true
 }
@@ -533,7 +646,7 @@ func (v Value) RegexOK() (pattern, options string, ok bool) {
 
 // DBPointer returns the BSON dbpointer value the Value represents. It panics if the value is a BSON
 // type other than DBPointer.
-func (v Value) DBPointer() (string, objectid.ObjectID) {
+func (v Value) DBPointer() (string, primitive.ObjectID) {
 	if v.Type != bsontype.DBPointer {
 		panic(ElementTypeError{"bsoncore.Value.DBPointer", v.Type})
 	}
@@ -546,13 +659,13 @@ func (v Value) DBPointer() (string, objectid.ObjectID) {
 
 // DBPointerOK is the same as DBPoitner, except that it returns a boolean
 // instead of panicking.
-func (v Value) DBPointerOK() (string, objectid.ObjectID, bool) {
+func (v Value) DBPointerOK() (string, primitive.ObjectID, bool) {
 	if v.Type != bsontype.DBPointer {
-		return "", objectid.ObjectID{}, false
+		return "", primitive.ObjectID{}, false
 	}
 	ns, pointer, _, ok := ReadDBPointer(v.Data)
 	if !ok {
-		return "", objectid.ObjectID{}, false
+		return "", primitive.ObjectID{}, false
 	}
 	return ns, pointer, true
 }
@@ -715,7 +828,7 @@ func (v Value) Int64OK() (int64, bool) {
 
 // Decimal128 returns the decimal the Value represents. It panics if the value is a BSON type other than
 // decimal.
-func (v Value) Decimal128() decimal.Decimal128 {
+func (v Value) Decimal128() primitive.Decimal128 {
 	if v.Type != bsontype.Decimal128 {
 		panic(ElementTypeError{"bsoncore.Value.Decimal128", v.Type})
 	}
@@ -728,13 +841,13 @@ func (v Value) Decimal128() decimal.Decimal128 {
 
 // Decimal128OK is the same as Decimal128, except that it returns a boolean
 // instead of panicking.
-func (v Value) Decimal128OK() (decimal.Decimal128, bool) {
+func (v Value) Decimal128OK() (primitive.Decimal128, bool) {
 	if v.Type != bsontype.Decimal128 {
-		return decimal.Decimal128{}, false
+		return primitive.Decimal128{}, false
 	}
 	d128, _, ok := ReadDecimal128(v.Data)
 	if !ok {
-		return decimal.Decimal128{}, false
+		return primitive.Decimal128{}, false
 	}
 	return d128, true
 }

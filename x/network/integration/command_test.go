@@ -10,15 +10,15 @@ import (
 	"context"
 	"testing"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/internal/testutil"
-	"github.com/mongodb/mongo-go-driver/x/bsonx"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/topology"
-	"github.com/mongodb/mongo-go-driver/x/network/address"
-	"github.com/mongodb/mongo-go-driver/x/network/command"
-	"github.com/mongodb/mongo-go-driver/x/network/description"
-	"github.com/mongodb/mongo-go-driver/x/network/result"
 	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/internal/testutil"
+	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/x/network/command"
+	"go.mongodb.org/mongo-driver/x/network/result"
 )
 
 func TestCommand(t *testing.T) {
@@ -31,7 +31,7 @@ func TestCommand(t *testing.T) {
 	}
 	t.Parallel()
 
-	server, err := topology.ConnectServer(context.Background(), address.Address(*host), serveropts(t)...)
+	server, err := topology.ConnectServer(address.Address(*host), nil, serveropts(t)...)
 	noerr(t, err)
 
 	ctx := context.Background()
@@ -41,7 +41,7 @@ func TestCommand(t *testing.T) {
 		DB:      "admin",
 		Command: bsonx.Doc{{"getnonce", bsonx.Int32(1)}},
 	}
-	rw, err := server.Connection(ctx)
+	rw, err := server.ConnectionLegacy(ctx)
 	noerr(t, err)
 
 	rdr, err := cmd.RoundTrip(ctx, server.SelectedDescription(), rw)
@@ -67,7 +67,7 @@ func TestCommand(t *testing.T) {
 	result = result[:0]
 	cmd.Command = bsonx.Doc{{"ping", bsonx.Int32(1)}}
 
-	rw, err = server.Connection(ctx)
+	rw, err = server.ConnectionLegacy(ctx)
 	noerr(t, err)
 	rdr, err = cmd.RoundTrip(ctx, server.SelectedDescription(), rw)
 	noerr(t, err)
@@ -85,9 +85,9 @@ func TestWriteCommands(t *testing.T) {
 	t.Run("Insert", func(t *testing.T) {
 		t.Run("Should return write error", func(t *testing.T) {
 			ctx := context.TODO()
-			server, err := testutil.Topology(t).SelectServer(context.Background(), description.WriteSelector())
+			server, err := testutil.Topology(t).SelectServerLegacy(context.Background(), description.WriteSelector())
 			noerr(t, err)
-			conn, err := server.Connection(context.Background())
+			conn, err := server.ConnectionLegacy(context.Background())
 			noerr(t, err)
 
 			cmd := &command.Insert{
@@ -98,7 +98,7 @@ func TestWriteCommands(t *testing.T) {
 			_, err = cmd.RoundTrip(ctx, server.SelectedDescription(), conn)
 			noerr(t, err)
 
-			conn, err = server.Connection(context.Background())
+			conn, err = server.ConnectionLegacy(context.Background())
 			noerr(t, err)
 			res, err := cmd.RoundTrip(ctx, server.SelectedDescription(), conn)
 			noerr(t, err)

@@ -16,9 +16,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/auth"
-	"github.com/mongodb/mongo-go-driver/x/network/connection"
-	"github.com/mongodb/mongo-go-driver/x/network/connstring"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/auth"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 )
 
 var host = flag.String("host", "127.0.0.1:27017", "specify the location of a running mongodb server.")
@@ -60,7 +60,12 @@ func noerr(t *testing.T, err error) {
 
 func autherr(t *testing.T, err error) {
 	t.Helper()
-	switch err.(type) {
+	switch e := err.(type) {
+	case topology.ConnectionError:
+		_, ok := e.Wrapped.(*auth.Error)
+		if !ok {
+			t.Fatal("Expected auth error and didn't get one")
+		}
 	case *auth.Error:
 		return
 	default:
@@ -121,13 +126,13 @@ func (nc *netconn) Close() error {
 }
 
 type dialer struct {
-	connection.Dialer
+	topology.Dialer
 	opened map[*netconn]struct{}
 	closed map[*netconn]struct{}
 	sync.Mutex
 }
 
-func newdialer(d connection.Dialer) *dialer {
+func newdialer(d topology.Dialer) *dialer {
 	return &dialer{Dialer: d, opened: make(map[*netconn]struct{}), closed: make(map[*netconn]struct{})}
 }
 
@@ -159,4 +164,26 @@ func (d *dialer) lenclosed() int {
 	d.Lock()
 	defer d.Unlock()
 	return len(d.closed)
+}
+
+// bootstrapConnections lists for num connections on the returned address. The user provided run
+// function will be called with the accepted connection. The user is responsible for closing the
+// connection.
+func bootstrapConnections(t *testing.T, num int, run func(net.Conn)) net.Addr {
+	l, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Errorf("Could not set up a listener: %v", err)
+		t.FailNow()
+	}
+	go func() {
+		for i := 0; i < num; i++ {
+			c, err := l.Accept()
+			if err != nil {
+				t.Errorf("Could not accept a connection: %v", err)
+			}
+			go run(c)
+		}
+		_ = l.Close()
+	}()
+	return l.Addr()
 }

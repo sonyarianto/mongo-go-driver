@@ -9,10 +9,9 @@ package topology
 import (
 	"time"
 
-	"github.com/mongodb/mongo-go-driver/bson"
-	"github.com/mongodb/mongo-go-driver/bson/bsoncodec"
-	"github.com/mongodb/mongo-go-driver/x/mongo/driver/session"
-	"github.com/mongodb/mongo-go-driver/x/network/connection"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/bsoncodec"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
 )
 
 var defaultRegistry = bson.NewRegistryBuilder().Build()
@@ -20,7 +19,7 @@ var defaultRegistry = bson.NewRegistryBuilder().Build()
 type serverConfig struct {
 	clock             *session.ClusterClock
 	compressionOpts   []string
-	connectionOpts    []connection.Option
+	connectionOpts    []ConnectionOption
 	appname           string
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
@@ -32,7 +31,7 @@ type serverConfig struct {
 func newServerConfig(opts ...ServerOption) (*serverConfig, error) {
 	cfg := &serverConfig{
 		heartbeatInterval: 10 * time.Second,
-		heartbeatTimeout:  30 * time.Second,
+		heartbeatTimeout:  10 * time.Second,
 		maxConns:          100,
 		maxIdleConns:      100,
 		registry:          defaultRegistry,
@@ -52,7 +51,7 @@ func newServerConfig(opts ...ServerOption) (*serverConfig, error) {
 type ServerOption func(*serverConfig) error
 
 // WithConnectionOptions configures the server's connections.
-func WithConnectionOptions(fn func(...connection.Option) []connection.Option) ServerOption {
+func WithConnectionOptions(fn func(...ConnectionOption) []ConnectionOption) ServerOption {
 	return func(cfg *serverConfig) error {
 		cfg.connectionOpts = fn(cfg.connectionOpts...)
 		return nil
