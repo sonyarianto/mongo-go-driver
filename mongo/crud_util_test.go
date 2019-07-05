@@ -13,6 +13,7 @@ import (
 	"math"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
@@ -526,6 +527,8 @@ func executeAggregate(sess *sessionImpl, coll *Collection, args map[string]inter
 			opts = opts.SetBatchSize(int32(opt.(float64)))
 		case "collation":
 			opts = opts.SetCollation(collationFromMap(opt.(map[string]interface{})))
+		case "maxTimeMS":
+			opts = opts.SetMaxTime(time.Duration(opt.(float64)) * time.Millisecond)
 		}
 	}
 
@@ -557,6 +560,26 @@ func executeWithTransaction(t *testing.T, sess *sessionImpl, collName string, db
 		return nil, err
 	}, opts)
 	return err
+}
+
+func executeRenameCollection(sess Session, coll *Collection, argmap map[string]interface{}) *SingleResult {
+	to := argmap["to"].(string)
+
+	cmd := bson.D{
+		{"renameCollection", strings.Join([]string{coll.db.name, coll.name}, ".")},
+		{"to", strings.Join([]string{coll.db.name, to}, ".")},
+	}
+
+	admin := coll.db.client.Database("admin")
+	if sess != nil {
+		sessCtx := sessionContext{
+			Context: context.WithValue(ctx, sessionKey{}, sess),
+			Session: sess,
+		}
+		return admin.RunCommand(sessCtx, cmd)
+	}
+
+	return admin.RunCommand(ctx, cmd)
 }
 
 func executeRunCommand(sess Session, db *Database, argmap map[string]interface{}, args json.RawMessage) *SingleResult {

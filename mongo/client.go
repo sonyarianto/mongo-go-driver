@@ -9,6 +9,7 @@ package mongo
 import (
 	"context"
 	"crypto/tls"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/auth"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/connstring"
@@ -27,11 +29,10 @@ import (
 	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/uuid"
-	"go.mongodb.org/mongo-driver/x/mongo/driverlegacy"
-	"go.mongodb.org/mongo-driver/x/network/command"
 )
 
 const defaultLocalThreshold = 15 * time.Millisecond
+const batchSize = 10000
 
 // Client performs operations on a given topology.
 type Client struct {
@@ -139,8 +140,12 @@ func (c *Client) Ping(ctx context.Context, rp *readpref.ReadPref) error {
 		rp = c.readPreference
 	}
 
-	_, err := c.topology.SelectServerLegacy(ctx, description.ReadPrefSelector(rp))
-	return replaceErrors(err)
+	db := c.Database("admin")
+	res := db.RunCommand(ctx, bson.D{
+		{"ping", 1},
+	})
+
+	return replaceErrors(res.Err())
 }
 
 // StartSession starts a new session.
@@ -167,6 +172,9 @@ func (c *Client) StartSession(opts ...*options.SessionOptions) (Session, error) 
 	if sopts.DefaultReadPreference != nil {
 		coreOpts.DefaultReadPreference = sopts.DefaultReadPreference
 	}
+	if sopts.DefaultMaxCommitTime != nil {
+		coreOpts.DefaultMaxCommitTime = sopts.DefaultMaxCommitTime
+	}
 
 	sess, err := session.NewClientSession(c.topology.SessionPool, c.id, session.Explicit, coreOpts)
 	if err != nil {
@@ -186,12 +194,31 @@ func (c *Client) endSessions(ctx context.Context) {
 	if c.topology.SessionPool == nil {
 		return
 	}
-	cmd := command.EndSessions{
-		Clock:      c.clock,
-		SessionIDs: c.topology.SessionPool.IDSlice(),
+
+	ids := c.topology.SessionPool.IDSlice()
+	idx, idArray := bsoncore.AppendArrayStart(nil)
+	for i, id := range ids {
+		idDoc, _ := id.MarshalBSON()
+		idArray = bsoncore.AppendDocumentElement(idArray, strconv.Itoa(i), idDoc)
+	}
+	idArray, _ = bsoncore.AppendArrayEnd(idArray, idx)
+
+	op := operation.NewEndSessions(idArray).ClusterClock(c.clock).Deployment(c.topology).
+		ServerSelector(description.ReadPrefSelector(readpref.PrimaryPreferred())).CommandMonitor(c.monitor).Database("admin")
+
+	idx, idArray = bsoncore.AppendArrayStart(nil)
+	totalNumIDs := len(ids)
+	for i := 0; i < totalNumIDs; i++ {
+		idDoc, _ := ids[i].MarshalBSON()
+		idArray = bsoncore.AppendDocumentElement(idArray, strconv.Itoa(i), idDoc)
+		if ((i+1)%batchSize) == 0 || i == totalNumIDs-1 {
+			idArray, _ = bsoncore.AppendArrayEnd(idArray, idx)
+			_ = op.SessionIDs(idArray).Execute(ctx)
+			idArray = idArray[:0]
+			idx = 0
+		}
 	}
 
-	_, _ = driverlegacy.EndSessions(ctx, cmd, c.topology, description.ReadPrefSelector(readpref.PrimaryPreferred()))
 }
 
 func (c *Client) configure(opts *options.ClientOptions) error {
@@ -365,6 +392,7 @@ func (c *Client) configure(opts *options.ClientOptions) error {
 		))
 	}
 	// RetryWrites
+	c.retryWrites = true // retry writes on by default
 	if opts.RetryWrites != nil {
 		c.retryWrites = *opts.RetryWrites
 	}
@@ -432,38 +460,43 @@ func (c *Client) ListDatabases(ctx context.Context, filter interface{}, opts ...
 	sess := sessionFromContext(ctx)
 
 	err := c.validSession(sess)
+	if sess == nil && c.topology.SessionPool != nil {
+		sess, err = session.NewClientSession(c.topology.SessionPool, c.id, session.Implicit)
+		if err != nil {
+			return ListDatabasesResult{}, err
+		}
+		defer sess.EndSession()
+	}
+
+	err = c.validSession(sess)
 	if err != nil {
 		return ListDatabasesResult{}, err
 	}
 
-	f, err := transformDocument(c.registry, filter)
+	filterDoc, err := transformBsoncoreDocument(c.registry, filter)
 	if err != nil {
 		return ListDatabasesResult{}, err
 	}
 
-	cmd := command.ListDatabases{
-		Filter:  f,
-		Session: sess,
-		Clock:   c.clock,
-	}
-
-	readSelector := description.CompositeSelector([]description.ServerSelector{
+	selector := makePinnedSelector(sess, description.CompositeSelector([]description.ServerSelector{
 		description.ReadPrefSelector(readpref.Primary()),
 		description.LatencySelector(c.localThreshold),
-	})
-	res, err := driverlegacy.ListDatabases(
-		ctx, cmd,
-		c.topology,
-		readSelector,
-		c.id,
-		c.topology.SessionPool,
-		opts...,
-	)
+	}))
+
+	ldo := options.MergeListDatabasesOptions(opts...)
+	op := operation.NewListDatabases(filterDoc).
+		Session(sess).ReadPreference(c.readPreference).CommandMonitor(c.monitor).
+		ServerSelector(selector).ClusterClock(c.clock).Database("admin").Deployment(c.topology)
+	if ldo.NameOnly != nil {
+		op = op.NameOnly(*ldo.NameOnly)
+	}
+
+	err = op.Execute(ctx)
 	if err != nil {
 		return ListDatabasesResult{}, replaceErrors(err)
 	}
 
-	return (ListDatabasesResult{}).fromResult(res), nil
+	return newListDatabasesResultFromOperation(op.Result()), nil
 }
 
 // ListDatabaseNames returns a slice containing the names of all of the databases on the server.
@@ -540,5 +573,13 @@ func (c *Client) Watch(ctx context.Context, pipeline interface{},
 		return nil, ErrClientDisconnected
 	}
 
-	return newClientChangeStream(ctx, c, pipeline, opts...)
+	csConfig := changeStreamConfig{
+		readConcern:    c.readConcern,
+		readPreference: c.readPreference,
+		client:         c,
+		registry:       c.registry,
+		streamType:     ClientStream,
+	}
+
+	return newChangeStream(ctx, csConfig, pipeline, opts...)
 }

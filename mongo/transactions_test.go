@@ -20,6 +20,7 @@ import (
 	"os"
 	"path"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
@@ -31,9 +32,10 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 	"go.mongodb.org/mongo-driver/x/bsonx"
+	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
-	"go.mongodb.org/mongo-driver/x/network/command"
 )
 
 const transactionTestsDir = "../data/transactions"
@@ -60,7 +62,7 @@ type transTestCase struct {
 	SessionOptions      map[string]interface{} `json:"sessionOptions"`
 	Operations          []*transOperation      `json:"operations"`
 	Outcome             *transOutcome          `json:"outcome"`
-	Expectations        []*transExpectation    `json:"expectations"`
+	Expectations        []*expectation         `json:"expectations"`
 	UseMultipleMongoses bool                   `json:"useMultipleMongoses"`
 }
 
@@ -89,6 +91,7 @@ type transOperation struct {
 	Result            json.RawMessage        `json:"result"`
 	Arguments         json.RawMessage        `json:"arguments"`
 	ArgMap            map[string]interface{}
+	Error             bool `json:"error"`
 }
 
 type transOutcome struct {
@@ -97,7 +100,7 @@ type transOutcome struct {
 	} `json:"collection"`
 }
 
-type transExpectation struct {
+type expectation struct {
 	CommandStartedEvent struct {
 		CommandName  string          `json:"command_name"`
 		DatabaseName string          `json:"database_name"`
@@ -112,18 +115,20 @@ type transError struct {
 	ErrorLabelsOmit    []string `bson:"errorLabelsOmit"`
 }
 
-var transStartedChan = make(chan *event.CommandStartedEvent, 100)
+var commandStarted []*event.CommandStartedEvent
 
 var transMonitor = &event.CommandMonitor{
 	Started: func(ctx context.Context, cse *event.CommandStartedEvent) {
-		transStartedChan <- cse
+		commandStarted = append(commandStarted, cse)
 	},
 }
 
 // test case for all TransactionSpec tests
 func TestTransactionSpec(t *testing.T) {
 	for _, file := range testhelpers.FindJSONFilesInDir(t, transactionTestsDir) {
-		runTransactionTestFile(t, path.Join(transactionTestsDir, file))
+		t.Run(file, func(t *testing.T) {
+			runTransactionTestFile(t, path.Join(transactionTestsDir, file))
+		})
 	}
 }
 
@@ -198,6 +203,34 @@ func runTransactionsTestCase(t *testing.T, test *transTestCase, testfile transTe
 			}
 		}
 
+		client := createTransactionsMonitoredClient(t, transMonitor, test.ClientOptions, shardedHost)
+		addClientOptions(client, test.ClientOptions)
+
+		db := client.Database(testfile.DatabaseName)
+
+		_ = db.Collection(collName, options.Collection().SetWriteConcern(writeconcern.New(writeconcern.WMajority()))).Drop(context.Background())
+
+		err := db.RunCommand(
+			context.Background(),
+			bsonx.Doc{{"create", bsonx.String(collName)}},
+		).Err()
+		require.NoError(t, err)
+
+		// client for setup data
+		var i map[string]interface{}
+		setupClient := createTransactionsMonitoredClient(t, transMonitor, i, shardedHost)
+		setupDb := setupClient.Database(testfile.DatabaseName)
+
+		// insert data if present
+		coll := setupDb.Collection(collName)
+		docsToInsert := docSliceToInterfaceSlice(docSliceFromRaw(t, testfile.Data))
+		if len(docsToInsert) > 0 {
+			coll2, err := coll.Clone(options.Collection().SetWriteConcern(writeconcern.New(writeconcern.WMajority())))
+			require.NoError(t, err)
+			_, err = coll2.InsertMany(context.Background(), docsToInsert)
+			require.NoError(t, err)
+		}
+
 		if test.FailPoint != nil {
 			doc := createFailPointDoc(t, test.FailPoint)
 			mongodbURI := testutil.ConnString(t)
@@ -217,29 +250,6 @@ func runTransactionsTestCase(t *testing.T, test *transTestCase, testfile transTe
 			failPointNames = append(failPointNames, test.FailPoint.ConfigureFailPoint)
 		}
 
-		client := createTransactionsMonitoredClient(t, transMonitor, test.ClientOptions, shardedHost)
-		addClientOptions(client, test.ClientOptions)
-
-		db := client.Database(testfile.DatabaseName)
-
-		_ = db.Collection(collName, options.Collection().SetWriteConcern(writeconcern.New(writeconcern.WMajority()))).Drop(context.Background())
-
-		err := db.RunCommand(
-			context.Background(),
-			bsonx.Doc{{"create", bsonx.String(collName)}},
-		).Err()
-		require.NoError(t, err)
-
-		// insert data if present
-		coll := db.Collection(collName)
-		docsToInsert := docSliceToInterfaceSlice(docSliceFromRaw(t, testfile.Data))
-		if len(docsToInsert) > 0 {
-			coll2, err := coll.Clone(options.Collection().SetWriteConcern(writeconcern.New(writeconcern.WMajority())))
-			require.NoError(t, err)
-			_, err = coll2.InsertMany(context.Background(), docsToInsert)
-			require.NoError(t, err)
-		}
-
 		var sess0Opts *options.SessionOptions
 		var sess1Opts *options.SessionOptions
 		if test.SessionOptions != nil {
@@ -249,6 +259,8 @@ func runTransactionsTestCase(t *testing.T, test *transTestCase, testfile transTe
 				sess1Opts = getSessionOptions(test.SessionOptions["session1"].(map[string]interface{}))
 			}
 		}
+
+		commandStarted = commandStarted[:0]
 
 		session0, err := client.StartSession(sess0Opts)
 		require.NoError(t, err)
@@ -265,11 +277,6 @@ func runTransactionsTestCase(t *testing.T, test *transTestCase, testfile transTe
 			sess0.EndSession(ctx)
 			sess1.EndSession(ctx)
 		}()
-
-		// Drain the channel so we only capture events for this test.
-		for len(transStartedChan) > 0 {
-			<-transStartedChan
-		}
 
 		for _, op := range test.Operations {
 			if op.Name == "count" {
@@ -320,6 +327,10 @@ func runTransactionsTestCase(t *testing.T, test *transTestCase, testfile transTe
 
 			// ensure error is what we expect
 			verifyError(t, err, op.Result)
+
+			if op.Error {
+				require.Error(t, err)
+			}
 		}
 
 		// Needs to be done here (in spite of defer) because some tests
@@ -342,19 +353,9 @@ func runTransactionsTestCase(t *testing.T, test *transTestCase, testfile transTe
 }
 
 func killSessions(t *testing.T, client *Client) {
-	s, err := client.topology.SelectServerLegacy(ctx, description.WriteSelector())
+	err := operation.NewCommand(bsoncore.BuildDocument(nil, bsoncore.AppendArrayElement(nil, "killAllSessions", bsoncore.BuildArray(nil)))).
+		Database("admin").ServerSelector(description.WriteSelector()).Deployment(client.topology).Execute(context.Background())
 	require.NoError(t, err)
-
-	vals := make(bsonx.Arr, 0, 0)
-	cmd := command.Write{
-		DB:      "admin",
-		Command: bsonx.Doc{{"killAllSessions", bsonx.Array(vals)}},
-	}
-	conn, err := s.ConnectionLegacy(ctx)
-	require.NoError(t, err)
-	defer testhelpers.RequireNoErrorOnClose(t, conn)
-	// ignore the error because command kills its own implicit session
-	_, _ = cmd.RoundTrip(context.Background(), s.SelectedDescription(), conn)
 }
 
 func disableFailpoints(t *testing.T, failPointNames *[]string) {
@@ -478,6 +479,11 @@ func executeSessionOperation(t *testing.T, op *transOperation, sess *sessionImpl
 		return sess.AbortTransaction(ctx)
 	case "withTransaction":
 		return executeWithTransaction(t, sess, collName, db, op.Arguments)
+	case "endSession":
+		sess.EndSession(ctx)
+		return nil
+	default:
+		require.Fail(t, "unknown operation", op.Name)
 	}
 	return nil
 }
@@ -615,8 +621,29 @@ func executeTestRunnerOperation(t *testing.T, op *transOperation, sess *sessionI
 		require.NotNil(t, sess.clientSession.PinnedServer)
 	case "assertSessionUnpinned":
 		require.Nil(t, sess.clientSession.PinnedServer)
+	case "assertSessionDirty":
+		require.NotNil(t, sess.clientSession.Server)
+		require.True(t, sess.clientSession.Server.Dirty)
+	case "assertSessionNotDirty":
+		require.NotNil(t, sess.clientSession.Server)
+		require.False(t, sess.clientSession.Server.Dirty)
+	case "assertSameLsidOnLastTwoCommands":
+		require.True(t, sameLsidOnLastTwoCommandEvents(t))
+	case "assertDifferentLsidOnLastTwoCommands":
+		require.False(t, sameLsidOnLastTwoCommandEvents(t))
+	default:
+		require.Fail(t, "unknown operation", op.Name)
 	}
 	return "", nil
+}
+
+func sameLsidOnLastTwoCommandEvents(t *testing.T) bool {
+	res := commandStarted[len(commandStarted)-2:]
+	require.Equal(t, len(res), 2)
+	if cmp.Equal(res[0].Command.Lookup("lsid"), res[1].Command.Lookup("lsid")) {
+		return true
+	}
+	return false
 }
 
 func verifyError(t *testing.T, e error, result json.RawMessage) {
@@ -685,14 +712,12 @@ func getErrorFromResult(t *testing.T, result json.RawMessage) *transError {
 	return &expected
 }
 
-func checkExpectations(t *testing.T, expectations []*transExpectation, id0 bsonx.Doc, id1 bsonx.Doc) {
-	for _, expectation := range expectations {
-		var evt *event.CommandStartedEvent
-		select {
-		case evt = <-transStartedChan:
-		default:
+func checkExpectations(t *testing.T, expectations []*expectation, id0 bsonx.Doc, id1 bsonx.Doc) {
+	for i, expectation := range expectations {
+		if i == len(commandStarted) {
 			require.Fail(t, "Expected command started event", expectation.CommandStartedEvent.CommandName)
 		}
+		evt := commandStarted[i]
 
 		require.Equal(t, expectation.CommandStartedEvent.CommandName, evt.CommandName)
 		require.Equal(t, expectation.CommandStartedEvent.DatabaseName, evt.DatabaseName)
@@ -792,6 +817,9 @@ func getSessionOptions(opts map[string]interface{}) *options.SessionOptions {
 			if transOpts["readPreference"] != nil {
 				sessOpts = sessOpts.SetDefaultReadPreference(getReadPref(transOpts["readPreference"]))
 			}
+			if transOpts["maxCommitTimeMS"] != nil {
+				sessOpts = sessOpts.SetDefaultMaxCommitTime(getMaxCommitTime(transOpts["maxCommitTimeMS"]))
+			}
 		}
 	}
 
@@ -808,6 +836,8 @@ func getTransactionOptions(opts map[string]interface{}) *options.TransactionOpti
 			transOpts = transOpts.SetReadPreference(getReadPref(opt))
 		case "readConcern":
 			transOpts = transOpts.SetReadConcern(getReadConcern(opt))
+		case "maxCommitTimeMS":
+			transOpts = transOpts.SetMaxCommitTime(getMaxCommitTime(opt))
 		}
 	}
 	return transOpts
@@ -839,6 +869,14 @@ func getReadConcern(opt interface{}) *readconcern.ReadConcern {
 func getReadPref(opt interface{}) *readpref.ReadPref {
 	if conv, ok := opt.(map[string]interface{}); ok {
 		return readPrefFromString(conv["mode"].(string))
+	}
+	return nil
+}
+
+func getMaxCommitTime(opt interface{}) *time.Duration {
+	if max, ok := opt.(float64); ok {
+		res := time.Duration(max) * time.Millisecond
+		return &res
 	}
 	return nil
 }

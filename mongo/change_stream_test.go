@@ -17,14 +17,12 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/internal/testutil/helpers"
+	testhelpers "go.mongodb.org/mongo-driver/internal/testutil/helpers"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 	"go.mongodb.org/mongo-driver/x/bsonx"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
-	"go.mongodb.org/mongo-driver/x/mongo/driverlegacy"
-	"go.mongodb.org/mongo-driver/x/network/command"
 )
 
 var collectionStartingDoc = bsonx.Doc{
@@ -58,7 +56,7 @@ func (ebc *errorBatchCursor) Server() driver.Server {
 }
 
 func (ebc *errorBatchCursor) Err() error {
-	return command.Error{
+	return driver.Error{
 		Code: ebc.errCode,
 	}
 }
@@ -71,10 +69,14 @@ func (ebc *errorBatchCursor) PostBatchResumeToken() bsoncore.Document {
 	return nil
 }
 
+func (ebc *errorBatchCursor) KillCursor(ctx context.Context) error {
+	return nil
+}
+
 func killChangeStreamCursor(t *testing.T, cs *ChangeStream) {
-	_, err := driverlegacy.KillCursors(context.Background(), cs.ns, cs.cursor.Server(), cs.ID())
+	err := cs.cursor.KillCursor(context.Background())
 	if err != nil {
-		t.Fatalf("error killing cursor: %v", err)
+		t.Fatalf("unable to kill change stream cursor: %v", err)
 	}
 }
 
@@ -192,6 +194,13 @@ func pbrtSupported(t *testing.T) bool {
 	return compareVersions(t, version, "4.0.7") >= 0
 }
 
+func versionSupported(t *testing.T, minVersion string) bool {
+	version, err := getServerVersion(createTestDatabase(t, nil))
+	testhelpers.RequireNil(t, err, "error getting server version: %v", err)
+
+	return compareVersions(t, version, minVersion) >= 0
+}
+
 func TestChangeStream(t *testing.T) {
 	skipIfBelow36(t)
 
@@ -217,15 +226,13 @@ func TestChangeStream(t *testing.T) {
 		require.NoError(t, err)
 		defer changes.Close(ctx)
 
-		require.NotEqual(t, len(changes.pipeline), 0)
+		require.NotEqual(t, len(changes.pipelineSlice), 0)
 
-		elem := changes.pipeline[0]
-
-		doc := elem.Document()
-		require.Equal(t, 1, len(doc))
-
-		_, err = doc.LookupErr("$changeStream")
-		require.NoError(t, err)
+		csDoc := changes.pipelineSlice[0]
+		elem, err := csDoc.IndexErr(0)
+		require.NoError(t, err, "no elements in change stream document")
+		require.Equal(t, "$changeStream", elem.Key(),
+			"key mismatch; expected $changeStream, got %s", elem.Key())
 	})
 
 	t.Run("TestReplaceRoot", func(t *testing.T) {
@@ -246,15 +253,20 @@ func TestChangeStream(t *testing.T) {
 		_, err := coll.InsertOne(context.Background(), bsonx.Doc{{"x", bsonx.Int32(7)}})
 		require.NoError(t, err)
 
-		pipeline := make(bsonx.Arr, 0)
-		pipeline = append(pipeline,
-			bsonx.Document(bsonx.Doc{{"$replaceRoot",
-				bsonx.Document(bsonx.Doc{{"newRoot",
-					bsonx.Document(bsonx.Doc{{"_id", bsonx.ObjectID(primitive.NewObjectID())}, {"x", bsonx.Int32(1)}})}}),
-			}}))
+		projectIDStage := bson.D{
+			{"$replaceRoot", bson.D{
+				{"newRoot", bson.D{
+					{"x", 1},
+				}},
+			}},
+		}
+		pipeline := bson.A{projectIDStage}
 		changes, err := coll.Watch(context.Background(), pipeline)
 		require.NoError(t, err)
 		defer changes.Close(ctx)
+
+		_, err = coll.InsertOne(context.Background(), bsonx.Doc{{"x", bsonx.Int32(4)}})
+		require.NoError(t, err)
 
 		_, err = coll.InsertOne(context.Background(), bsonx.Doc{{"x", bsonx.Int32(4)}})
 		require.NoError(t, err)
@@ -353,6 +365,8 @@ func TestChangeStream_ReplicaSet(t *testing.T) {
 
 		coll.writeConcern = wcMajority
 		_, err := coll.InsertOne(ctx, doc1)
+		testhelpers.RequireNil(t, err, "error running insertOne: %s", err)
+		_, err = coll.InsertOne(ctx, doc1)
 		testhelpers.RequireNil(t, err, "error running insertOne: %s", err)
 
 		// Next should set the change stream error and return false if a document is missing the resume token
@@ -464,7 +478,7 @@ func TestChangeStream_ReplicaSet(t *testing.T) {
 		defer closeCursor(stream)
 		cs := stream
 
-		if cs.sess.(*sessionImpl).clientSession.Terminated {
+		if cs.sess.Terminated {
 			t.Fatalf("session was prematurely terminated")
 		}
 	})
@@ -743,13 +757,17 @@ func TestChangeStream_ReplicaSet(t *testing.T) {
 					name                 string
 					opts                 *options.ChangeStreamOptions
 					expectedInitialToken bson.Raw
+					minServerVersion     string
 				}{
-					{"startAfter", options.ChangeStream().SetStartAfter(token), token},
-					{"resumeAfter", options.ChangeStream().SetResumeAfter(token), token},
-					{"neither", options.ChangeStream().SetStartAtOperationTime(&opTime), nil},
+					{"startAfter", options.ChangeStream().SetStartAfter(token), token, "4.1.1"},
+					{"resumeAfter", options.ChangeStream().SetResumeAfter(token), token, "4.0.7"},
+					{"neither", options.ChangeStream().SetStartAtOperationTime(&opTime), nil, "4.0.7"},
 				}
 				for _, tc := range cases {
 					t.Run(tc.name, func(t *testing.T) {
+						if !versionSupported(t, tc.minServerVersion) {
+							t.Skip("skipping for older server verions")
+						}
 						drainChannels()
 						stream, err := coll.Watch(ctx, Pipeline{}, tc.opts)
 						testhelpers.RequireNil(t, err, "error restarting stream: %v", err)

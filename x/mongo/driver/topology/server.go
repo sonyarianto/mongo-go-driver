@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"math"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -22,15 +21,11 @@ import (
 	"go.mongodb.org/mongo-driver/x/mongo/driver/address"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/operation"
-	connectionlegacy "go.mongodb.org/mongo-driver/x/network/connection"
-	"go.mongodb.org/mongo-driver/x/network/result"
 	"golang.org/x/sync/semaphore"
 )
 
 const minHeartbeatInterval = 500 * time.Millisecond
 const connectionSemaphoreSize = math.MaxInt64
-
-var isMasterOrRecoveringCodes = []int32{11600, 11602, 10107, 13435, 13436, 189, 91}
 
 // ErrServerClosed occurs when an attempt to get a connection is made after
 // the server has been closed.
@@ -230,38 +225,6 @@ func (s *Server) Connection(ctx context.Context) (driver.Connection, error) {
 	return &Connection{connection: conn, s: s}, nil
 }
 
-// ConnectionLegacy gets a connection to the server.
-func (s *Server) ConnectionLegacy(ctx context.Context) (connectionlegacy.Connection, error) {
-	if atomic.LoadInt32(&s.connectionstate) != connected {
-		return nil, ErrServerClosed
-	}
-
-	err := s.sem.Acquire(ctx, 1)
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := s.pool.get(ctx)
-	if err != nil {
-		s.sem.Release(1)
-		connerr, ok := err.(ConnectionError)
-		if !ok {
-			return nil, err
-		}
-
-		// Since the only kind of ConnectionError we receive from pool.get will be an initialization
-		// error, we should set the description.Server appropriately.
-		desc := description.Server{
-			Kind:      description.Unknown,
-			LastError: connerr.Wrapped,
-		}
-		s.updateDescription(desc, false)
-
-		return nil, err
-	}
-	return newConnectionLegacy(conn, s, s.cfg.connectionOpts...)
-}
-
 // Description returns a description of the server as of the last heartbeat.
 func (s *Server) Description() description.Server {
 	return s.desc.Load().(description.Server)
@@ -328,6 +291,16 @@ func (s *Server) ProcessError(err error) {
 		s.pool.drain()
 		return
 	}
+	if wcerr, ok := err.(driver.WriteConcernError); ok && (wcerr.NodeIsRecovering() || wcerr.NotMaster()) {
+		desc := s.Description()
+		desc.Kind = description.Unknown
+		desc.LastError = err
+		// updates description to unknown
+		s.updateDescription(desc, false)
+		s.RequestImmediateCheck()
+		s.pool.drain()
+		return
+	}
 
 	ne, ok := err.(ConnectionError)
 	if !ok {
@@ -346,32 +319,6 @@ func (s *Server) ProcessError(err error) {
 	desc.LastError = err
 	// updates description to unknown
 	s.updateDescription(desc, false)
-}
-
-// ProcessWriteConcernError checks if a WriteConcernError is an isNotMaster or
-// isRecovering error, and if so updates the server accordingly.
-func (s *Server) ProcessWriteConcernError(err *result.WriteConcernError) {
-	if err == nil || !wceIsNotMasterOrRecovering(err) {
-		return
-	}
-	desc := s.Description()
-	desc.Kind = description.Unknown
-	desc.LastError = err
-	// updates description to unknown
-	s.updateDescription(desc, false)
-	s.RequestImmediateCheck()
-}
-
-func wceIsNotMasterOrRecovering(wce *result.WriteConcernError) bool {
-	for _, code := range isMasterOrRecoveringCodes {
-		if int32(wce.Code) == code {
-			return true
-		}
-	}
-	if strings.Contains(wce.ErrMsg, "not master") || strings.Contains(wce.ErrMsg, "node is recovering") {
-		return true
-	}
-	return false
 }
 
 // update handles performing heartbeats and updating any subscribers of the
@@ -485,6 +432,9 @@ func (s *Server) heartbeat(conn *connection) (description.Server, *connection) {
 	ctx := context.Background()
 
 	for i := 1; i <= maxRetry; i++ {
+		var now time.Time
+		var descPtr *description.Server
+
 		if conn != nil && conn.expired() {
 			if conn.nc != nil {
 				conn.nc.Close()
@@ -499,47 +449,42 @@ func (s *Server) heartbeat(conn *connection) (description.Server, *connection) {
 				WithWriteTimeout(func(time.Duration) time.Duration { return s.cfg.heartbeatTimeout }),
 			}
 			opts = append(opts, s.cfg.connectionOpts...)
-			// We override whatever handshaker is currently attached to the options with an empty
+			// We override whatever handshaker is currently attached to the options with a basic
 			// one because need to make sure we don't do auth.
 			opts = append(opts, WithHandshaker(func(h Handshaker) Handshaker {
-				return nil
+				now = time.Now()
+				return operation.NewIsMaster().AppName(s.cfg.appname).Compressors(s.cfg.compressionOpts)
 			}))
 
 			// Override any command monitors specified in options with nil to avoid monitoring heartbeats.
 			opts = append(opts, WithMonitor(func(*event.CommandMonitor) *event.CommandMonitor {
 				return nil
 			}))
+
 			conn, err = newConnection(ctx, s.address, opts...)
-			if err != nil {
-				saved = err
-				if conn != nil && conn.nc != nil {
-					conn.nc.Close()
-				}
-				conn = nil
-				if _, ok := err.(ConnectionError); ok {
-					s.pool.drain()
-					// If the server is not connected, give up and exit loop
-					if s.Description().Kind == description.Unknown {
-						break
-					}
-				}
-				continue
+			if err == nil {
+				descPtr = &conn.desc
 			}
 		}
 
-		now := time.Now()
+		// do a heartbeat because a new connection wasn't created so a handshake was not performed
+		if descPtr == nil && err == nil {
+			now = time.Now()
+			op := operation.
+				NewIsMaster().
+				ClusterClock(s.cfg.clock).
+				Deployment(driver.SingleConnectionDeployment{initConnection{conn}})
+			err = op.Execute(ctx)
+			if err == nil {
+				tmpDesc := op.Result(s.address)
+				descPtr = &tmpDesc
+			}
+		}
 
-		op := operation.
-			NewIsMaster().
-			ClusterClock(s.cfg.clock).
-			AppName(s.cfg.appname).
-			Compressors(s.cfg.compressionOpts).
-			Deployment(driver.SingleConnectionDeployment{initConnection{conn}})
-		err = op.Execute(ctx)
 		// we do a retry if the server is connected, if succeed return new server desc (see below)
 		if err != nil {
 			saved = err
-			if conn.nc != nil {
+			if conn != nil && conn.nc != nil {
 				conn.nc.Close()
 			}
 			conn = nil
@@ -553,8 +498,7 @@ func (s *Server) heartbeat(conn *connection) (description.Server, *connection) {
 			continue
 		}
 
-		desc = op.Result(s.address)
-
+		desc = *descPtr
 		delay := time.Since(now)
 		desc = desc.SetAverageRTT(s.updateAverageRTT(delay))
 		desc.HeartbeatInterval = s.cfg.heartbeatInterval

@@ -32,7 +32,7 @@ func (op Operation) PackageName() string { return op.pkg }
 
 // Generate creates the operation type and associated response types and writes them to w.
 func (op Operation) Generate(w io.Writer) error {
-	t, err := template.New("operation").Parse(typeTemplate)
+	t, err := template.New(op.Name + " operation").Parse(typeTemplate)
 	if err != nil {
 		return err
 	}
@@ -96,7 +96,12 @@ func (op Operation) ConstructorFields() []string {
 		if !field.Constructor {
 			continue
 		}
-		fields = append(fields, name+": "+name+",")
+		// either "name: name," or "name: &name,"
+		fieldName := name
+		if field.PointerType() {
+			fieldName = "&" + name
+		}
+		fields = append(fields, name+": "+fieldName+",")
 	}
 	return fields
 }
@@ -138,7 +143,7 @@ func (op Operation) CommandMethod() (string, error) {
 		case "document":
 			tmpl = commandParamDocumentTmpl
 		case "array":
-			tmpl = commandParamArrayImpl
+			tmpl = commandParamArrayTmpl
 		case "boolean":
 			tmpl = commandParamBooleanTmpl
 		case "int32":
@@ -180,7 +185,7 @@ func (op Operation) CommandMethod() (string, error) {
 		case "document":
 			tmpl = commandParamDocumentTmpl
 		case "array":
-			tmpl = commandParamArrayImpl
+			tmpl = commandParamArrayTmpl
 		case "boolean":
 			tmpl = commandParamBooleanTmpl
 		case "int32":
@@ -202,6 +207,9 @@ func (op Operation) CommandMethod() (string, error) {
 		rf.ShortName = op.ShortName()
 		rf.Name = name
 		rf.ParameterName = name
+		if field.KeyName != "" {
+			rf.ParameterName = field.KeyName
+		}
 		rf.MinWireVersion = field.MinWireVersion
 		rf.MinWireVersionRequired = field.MinWireVersionRequired
 		err := tmpl.Execute(&buf, rf)
@@ -533,6 +541,7 @@ type RequestField struct {
 	Documentation          string
 	MinWireVersion         int
 	MinWireVersionRequired int
+	KeyName                string
 }
 
 // Command returns a string function that sets the key to name and value to the RequestField type.
@@ -626,6 +635,18 @@ type ResponseField struct {
 	Documentation string
 }
 
+// DeclarationType returns the field's type for use in a struct type declaration.
+func (rf ResponseField) DeclarationType() string {
+	switch rf.Type {
+	case "boolean":
+		return "bool"
+	case "value":
+		return "bsoncore.Value"
+	default:
+		return rf.Type
+	}
+}
+
 // BuiltinResponseType is the type used to define built in response types.
 type BuiltinResponseType string
 
@@ -636,15 +657,32 @@ const (
 
 // BuildMethod handles creating the body of a method to create a response from a BSON response
 // document.
+//
+// TODO(GODRIVER-1094): This method is hacky because we're not using nested templates like we should
+// be. Each template should be registered and we should be calling the template to create it.
 func (r Response) BuildMethod() (string, error) {
 	var buf bytes.Buffer
-	for name, field := range r.Field {
+	names := make([]string, 0, len(r.Field))
+	for name := range r.Field {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		field := r.Field[name]
 		var tmpl *template.Template
 		switch field.Type {
+		case "boolean":
+			tmpl = responseFieldBooleanTmpl
 		case "int32":
 			tmpl = responseFieldInt32Tmpl
 		case "int64":
 			tmpl = responseFieldInt64Tmpl
+		case "string":
+			tmpl = responseFieldStringTmpl
+		case "value":
+			tmpl = responseFieldValueTmpl
+		case "document":
+			tmpl = responseFieldDocumentTmpl
 		default:
 			return "", fmt.Errorf("unknown response field type %s", field.Type)
 		}

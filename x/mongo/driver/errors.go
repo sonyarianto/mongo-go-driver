@@ -17,6 +17,8 @@ var (
 )
 
 var (
+	// UnknownTransactionCommitResult is an error label for unknown transaction commit results.
+	UnknownTransactionCommitResult = "UnknownTransactionCommitResult"
 	// TransientTransactionError is an error label for transient errors with transactions.
 	TransientTransactionError = "TransientTransactionError"
 	// NetworkError is an error label for network errors.
@@ -108,6 +110,26 @@ func (wce WriteConcernError) Retryable() bool {
 	}
 
 	return false
+}
+
+// NodeIsRecovering returns true if this error is a node is recovering error.
+func (wce WriteConcernError) NodeIsRecovering() bool {
+	for _, code := range nodeIsRecoveringCodes {
+		if wce.Code == int64(code) {
+			return true
+		}
+	}
+	return strings.Contains(wce.Message, "node is recovering")
+}
+
+// NotMaster returns true if this error is a not master error.
+func (wce WriteConcernError) NotMaster() bool {
+	for _, code := range notMasterCodes {
+		if wce.Code == int64(code) {
+			return true
+		}
+	}
+	return strings.Contains(wce.Message, "not master")
 }
 
 // WriteError is a non-write concern failure that occurred as a result of a write
@@ -212,6 +234,11 @@ func (e Error) NotMaster() bool {
 		}
 	}
 	return strings.Contains(e.Message, "not master")
+}
+
+// NamespaceNotFound returns true if this errors is a NamespaceNotFound error.
+func (e Error) NamespaceNotFound() bool {
+	return e.Code == 26 || e.Message == "ns not found"
 }
 
 // helper method to extract an error from a reader if there is one; first returned item is the

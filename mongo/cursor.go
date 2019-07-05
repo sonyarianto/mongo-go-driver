@@ -15,8 +15,8 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsoncodec"
 	"go.mongodb.org/mongo-driver/x/bsonx/bsoncore"
+	"go.mongodb.org/mongo-driver/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/session"
-	"go.mongodb.org/mongo-driver/x/mongo/driverlegacy"
 )
 
 // Cursor is used to iterate a stream of documents. Each document is decoded into the result
@@ -78,7 +78,7 @@ func newCursorWithSession(bc batchCursor, registry *bsoncodec.Registry, clientSe
 }
 
 func newEmptyCursor() *Cursor {
-	return &Cursor{bc: driverlegacy.NewEmptyBatchCursor()}
+	return &Cursor{bc: driver.NewEmptyBatchCursor()}
 }
 
 // ID returns the ID of this cursor.
@@ -149,7 +149,7 @@ func (c *Cursor) Err() error { return c.err }
 
 // Close closes this cursor.
 func (c *Cursor) Close(ctx context.Context) error {
-	c.closeImplicitSession()
+	defer c.closeImplicitSession()
 	return c.bc.Close(ctx)
 }
 
@@ -222,4 +222,11 @@ func (c *Cursor) closeImplicitSession() {
 	if c.clientSession != nil && c.clientSession.SessionType == session.Implicit {
 		c.clientSession.EndSession()
 	}
+}
+
+// BatchCursorFromCursor returns a driver.BatchCursor for the given Cursor. If there is no underlying driver.BatchCursor,
+// nil is returned. This method is deprecated and does not have any stability guarantees. It may be removed in the future.
+func BatchCursorFromCursor(c *Cursor) *driver.BatchCursor {
+	bc, _ := c.bc.(*driver.BatchCursor)
+	return bc
 }

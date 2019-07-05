@@ -12,8 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/x/mongo/driver"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/description"
 	"go.mongodb.org/mongo-driver/x/mongo/driver/drivertest"
-	wiremessagex "go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
-	"go.mongodb.org/mongo-driver/x/network/wiremessage"
+	"go.mongodb.org/mongo-driver/x/mongo/driver/wiremessage"
 )
 
 type opQuery struct {
@@ -59,13 +58,13 @@ func initLegacyDb(t *testing.T, db *Database) {
 	}
 }
 
-func validateHeader(t *testing.T, wm []byte, expectedOpcode wiremessagex.OpCode) []byte {
+func validateHeader(t *testing.T, wm []byte, expectedOpcode wiremessage.OpCode) []byte {
 	actualLen := len(wm)
 	var readLen int32
-	var opcode wiremessagex.OpCode
+	var opcode wiremessage.OpCode
 	var ok bool
 
-	readLen, _, _, opcode, wm, ok = wiremessagex.ReadHeader(wm)
+	readLen, _, _, opcode, wm, ok = wiremessage.ReadHeader(wm)
 	if !ok {
 		t.Fatalf("could not read header")
 	}
@@ -88,7 +87,7 @@ func validateQueryWiremessage(t *testing.T, wm []byte, expected opQuery) {
 
 	wm = validateHeader(t, wm, wiremessage.OpQuery)
 
-	flags, wm, ok = wiremessagex.ReadQueryFlags(wm)
+	flags, wm, ok = wiremessage.ReadQueryFlags(wm)
 	if !ok {
 		t.Fatalf("could not read flags")
 	}
@@ -96,7 +95,7 @@ func validateQueryWiremessage(t *testing.T, wm []byte, expected opQuery) {
 		t.Fatalf("flags mismatch; expected %d, got %d", expected.flags, flags)
 	}
 
-	fullCollName, wm, ok = wiremessagex.ReadQueryFullCollectionName(wm)
+	fullCollName, wm, ok = wiremessage.ReadQueryFullCollectionName(wm)
 	if !ok {
 		t.Fatalf("could not read fullCollectionName")
 	}
@@ -104,7 +103,7 @@ func validateQueryWiremessage(t *testing.T, wm []byte, expected opQuery) {
 		t.Fatalf("fullCollectionName mismatch; expected %s, got %s", expected.fullCollectionName, fullCollName)
 	}
 
-	numToSkip, wm, ok = wiremessagex.ReadQueryNumberToSkip(wm)
+	numToSkip, wm, ok = wiremessage.ReadQueryNumberToSkip(wm)
 	if !ok {
 		t.Fatalf("could not read numberToSkip")
 	}
@@ -112,7 +111,7 @@ func validateQueryWiremessage(t *testing.T, wm []byte, expected opQuery) {
 		t.Fatalf("numberToSkip mismatch; expected %d, got %d", expected.numToSkip, numToSkip)
 	}
 
-	numToReturn, wm, ok = wiremessagex.ReadQueryNumberToReturn(wm)
+	numToReturn, wm, ok = wiremessage.ReadQueryNumberToReturn(wm)
 	if !ok {
 		t.Fatalf("could not read numberToReturn")
 	}
@@ -120,7 +119,7 @@ func validateQueryWiremessage(t *testing.T, wm []byte, expected opQuery) {
 		t.Fatalf("numberToReturn mismatch; expected %d, got %d", expected.numToReturn, numToReturn)
 	}
 
-	query, wm, ok = wiremessagex.ReadQueryQuery(wm)
+	query, wm, ok = wiremessage.ReadQueryQuery(wm)
 	if !ok {
 		t.Fatalf("could not read query")
 	}
@@ -139,7 +138,7 @@ func validateQueryWiremessage(t *testing.T, wm []byte, expected opQuery) {
 		return
 	}
 
-	returnFieldsSelector, wm, ok = wiremessagex.ReadQueryReturnFieldsSelector(wm)
+	returnFieldsSelector, wm, ok = wiremessage.ReadQueryReturnFieldsSelector(wm)
 	if !ok {
 		t.Fatalf("could not read returnFieldsSelector")
 	}
@@ -241,7 +240,6 @@ func TestOperationLegacy(t *testing.T) {
 			t.Fatalf("error marshalling response: %v", err)
 		}
 		fakeOpReply := drivertest.MakeReply(resBytes)
-		readPrefElem := bson.E{Key: "$readPreference", Value: bson.D{{"mode", "primaryPreferred"}}}
 
 		maxDoc := bson.D{{"indexBounds", bson.D{{"x", 50}}}}
 		minDoc := bson.D{{"indexBounds", bson.D{{"x", 50}}}}
@@ -296,7 +294,6 @@ func TestOperationLegacy(t *testing.T) {
 			{"$showDiskLoc", false},
 			{"$snapshot", false},
 			{"$orderby", sort},
-			readPrefElem,
 		}
 		findQuery := opQuery{
 			flags:                wiremessage.QueryFlag(wiremessage.Partial | wiremessage.TailableCursor | wiremessage.NoCursorTimeout | wiremessage.OplogReplay | wiremessage.SlaveOK),
@@ -311,8 +308,7 @@ func TestOperationLegacy(t *testing.T) {
 		regexDoc := bson.D{{"name", primitive.Regex{Pattern: "^[^$]*$"}}}
 		modifiedFilterDoc := bson.D{{"name", fullCollName("foo")}}
 		listCollDoc := bson.D{
-			{"$query", bson.D{{"$and", bson.A{regexDoc, modifiedFilterDoc}}}},
-			readPrefElem,
+			{"$and", bson.A{regexDoc, modifiedFilterDoc}},
 		}
 		listCollQuery := opQuery{
 			flags:              wiremessage.SlaveOK,
@@ -324,7 +320,6 @@ func TestOperationLegacy(t *testing.T) {
 		listIndexesDoc := bson.D{
 			{"$query", bson.D{{"ns", fullCollName("foo")}}},
 			{"$maxTimeMS", int64(10000)},
-			readPrefElem,
 		}
 		listIndexesQuery := opQuery{
 			flags:              wiremessage.SlaveOK,
@@ -393,21 +388,21 @@ func TestOperationLegacy(t *testing.T) {
 			var ok bool
 
 			wm = validateHeader(t, wm, wiremessage.OpKillCursors)
-			zero, wm, ok = wiremessagex.ReadKillCursorsZero(wm)
+			zero, wm, ok = wiremessage.ReadKillCursorsZero(wm)
 			if !ok {
 				t.Fatalf("could not read zero field")
 			}
 			if zero != 0 {
 				t.Fatalf("zero mismatch; expected 0, got %d", zero)
 			}
-			numCursorIDs, wm, ok = wiremessagex.ReadKillCursorsNumberIDs(wm)
+			numCursorIDs, wm, ok = wiremessage.ReadKillCursorsNumberIDs(wm)
 			if !ok {
 				t.Fatalf("could not read numberOfCursorIDs field")
 			}
 			if numCursorIDs != int32(len(cursors)) {
 				t.Fatalf("numberOfCursorIDs mismatch; expected %d, got %d", len(cursors), numCursorIDs)
 			}
-			cursorIDs, wm, ok = wiremessagex.ReadKillCursorsCursorIDs(wm, numCursorIDs)
+			cursorIDs, wm, ok = wiremessage.ReadKillCursorsCursorIDs(wm, numCursorIDs)
 			if !ok {
 				t.Fatalf("could not read cursorIDs field")
 			}
